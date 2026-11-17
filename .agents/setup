@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb: installs mise and the toolchain pinned in mise.toml.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name="$1"
+  shift
+  local start=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - start))s)"
+}
+
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+install_mise() {
+  if command -v mise >/dev/null 2>&1; then
+    mise --version
+  else
+    curl -fsSL https://mise.run | MISE_QUIET=1 sh
+  fi
+}
+
+install_toolchain() {
+  mise trust --quiet "$repo_root/mise.toml"
+  mise install --yes
+}
+
+persist_shell_env() {
+  local marker="# oath: mise toolchain"
+  if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >>"$HOME/.bash_profile" <<'EOF'
+
+# oath: mise toolchain
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+EOF
+  fi
+}
+
+step "install mise" install_mise
+step "install mise.toml toolchain" install_toolchain
+step "persist mise shims in login shells" persist_shell_env
+step "check toolchain" mise exec -- rustc --version

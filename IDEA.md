@@ -31,7 +31,7 @@ The vocabulary is deliberately familiar. Commands, events, aggregates, and proje
 4. **Invalid states are unrepresentable.** Types, state machines, and invariants make illegal values and illegal transitions impossible to express, not merely unlikely.
 5. **Decisions are pure; effects live at the edges.** Deciding what should happen never touches the outside world. Talking to the outside world never makes business decisions. The same inputs always produce the same decisions.
 6. **Everything is explicit.** Every state change has a named cause. Every reaction has a named trigger. Nothing happens implicitly.
-7. **Built for both readers.** The model should be equally legible to a human skimming it and an agent reasoning about it. If a concept is hard to explain, it is modeled wrong.
+7. **Built for both readers.** The model should be equally legible to a human skimming it and an agent reasoning about it. If a concept is hard to explain in the model, the model or Oath's primitives should change until it isn't.
 
 ## Primitives
 

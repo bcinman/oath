@@ -1,4 +1,4 @@
-use oath::{Aggregate, Command, Edge, Event, Handle, NotAllowed, Rejection, Transition};
+use oath::{Aggregate, Command, Decision, Edge, Event, Handle, NotAllowed, Rejection, Transition};
 
 #[oath::id] pub struct OrderId(pub String);
 
@@ -31,49 +31,44 @@ pub enum Order {
 }
 
 impl Handle<PlaceOrder> for Draft {
-    fn decide(&self, c: &PlaceOrder) -> Result<Vec<OrderEvent>, OrderRejection> {
-        Ok(vec![OrderPlaced { total: c.total }.into()])
+    fn decide(&self, c: &PlaceOrder) -> Decision<Self> {
+        Ok(self.emit(OrderPlaced { total: c.total }).into())
     }
 }
 impl Transition<OrderPlaced> for Draft {
-    type To = Placed;
     fn evolve(self, e: &OrderPlaced) -> Placed { Placed { total: e.total } }
 }
 
 impl Handle<PayOrder> for Placed {
-    fn decide(&self, c: &PayOrder) -> Result<Vec<OrderEvent>, OrderRejection> {
+    fn decide(&self, c: &PayOrder) -> Decision<Self> {
         if c.amount != self.total {
             return Err(OrderRejection::WrongAmount { expected: self.total });
         }
-        Ok(vec![OrderPaid { amount: c.amount }.into()])
+        Ok(self.emit(OrderPaid { amount: c.amount }).into())
     }
 }
 impl Handle<CancelOrder> for Placed {
-    fn decide(&self, _: &CancelOrder) -> Result<Vec<OrderEvent>, OrderRejection> {
-        Ok(vec![OrderCancelled.into()])
+    fn decide(&self, _: &CancelOrder) -> Decision<Self> {
+        Ok(self.emit(OrderCancelled).into())
     }
 }
 impl Transition<OrderPaid> for Placed {
-    type To = Paid;
     fn evolve(self, e: &OrderPaid) -> Paid { Paid { amount: e.amount } }
 }
 impl Transition<OrderCancelled> for Placed {
-    type To = Cancelled;
     fn evolve(self, _: &OrderCancelled) -> Cancelled { Cancelled }
 }
 
 // Cancelling a paid order records two events: the refund, then the cancellation.
 impl Handle<CancelOrder> for Paid {
-    fn decide(&self, _: &CancelOrder) -> Result<Vec<OrderEvent>, OrderRejection> {
-        Ok(vec![RefundIssued { amount: self.amount }.into(), OrderCancelled.into()])
+    fn decide(&self, _: &CancelOrder) -> Decision<Self> {
+        Ok(self.emit(RefundIssued { amount: self.amount }).then(OrderCancelled).into())
     }
 }
 impl Transition<RefundIssued> for Paid {
-    type To = Paid;
     fn evolve(self, _: &RefundIssued) -> Paid { Paid { amount: 0 } }
 }
 impl Transition<OrderCancelled> for Paid {
-    type To = Cancelled;
     fn evolve(self, _: &OrderCancelled) -> Cancelled { Cancelled }
 }
 

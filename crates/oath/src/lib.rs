@@ -29,7 +29,7 @@
 //! rejected with [`NotAllowed`]. The `#[initial]` state's struct must implement `Default`.
 //!
 //! ```
-//! use oath::{Aggregate, Command, Handle, NotAllowed, Transition};
+//! use oath::{Aggregate, Command, Decision, Handle, NotAllowed, Transition};
 //!
 //! #[oath::id] pub struct OrderId(pub String);
 //!
@@ -56,21 +56,19 @@
 //! }
 //!
 //! impl Handle<PlaceOrder> for Draft {
-//!     fn decide(&self, c: &PlaceOrder) -> Result<Vec<OrderEvent>, OrderRejection> {
-//!         Ok(vec![OrderPlaced { total: c.total }.into()])
+//!     fn decide(&self, c: &PlaceOrder) -> Decision<Self> {
+//!         Ok(self.emit(OrderPlaced { total: c.total }).into())
 //!     }
 //! }
 //! impl Transition<OrderPlaced> for Draft {
-//!     type To = Placed;
 //!     fn evolve(self, e: &OrderPlaced) -> Placed { Placed { total: e.total } }
 //! }
 //! impl Handle<PayOrder> for Placed {
-//!     fn decide(&self, _: &PayOrder) -> Result<Vec<OrderEvent>, OrderRejection> {
-//!         Ok(vec![OrderPaid { amount: self.total }.into()])
+//!     fn decide(&self, _: &PayOrder) -> Decision<Self> {
+//!         Ok(self.emit(OrderPaid { amount: self.total }).into())
 //!     }
 //! }
 //! impl Transition<OrderPaid> for Placed {
-//!     type To = Paid;
 //!     fn evolve(self, _: &OrderPaid) -> Paid { Paid }
 //! }
 //!
@@ -173,7 +171,7 @@ pub trait Aggregate: Default + __private::Sealed {
 }
 
 /// One state of an aggregate. Implemented by `#[oath::aggregate]` for each state struct.
-pub trait State {
+pub trait State: Sized {
     /// The aggregate this state belongs to.
     type Aggregate: Aggregate;
 }
@@ -182,21 +180,89 @@ pub trait State {
 pub type EventOf<S> = <<S as State>::Aggregate as Aggregate>::Event;
 /// The rejection type of the aggregate that state `S` belongs to.
 pub type RejectionOf<S> = <<S as State>::Aggregate as Aggregate>::Rejection;
+/// What a state's [`Handle::decide`] returns: the events to record, or a rejection.
+pub type Decision<S> = Result<Events<S>, RejectionOf<S>>;
+
+/// Marks that a state lists command `C` in its `accepts(...)`. Implemented only by
+/// `#[oath::aggregate]`, from the transition table.
+#[diagnostic::on_unimplemented(
+    message = "state `{Self}` does not accept command `{C}`",
+    label = "`{Self}` does not list `{C}`",
+    note = "add `{C}` to {Self}'s #[state(accepts(...))], or remove this Handle impl"
+)]
+pub trait Accepts<C>: State {}
+
+/// Marks that a state lists `E => To` in its `on(...)`. Implemented only by
+/// `#[oath::aggregate]`, from the transition table.
+#[diagnostic::on_unimplemented(
+    message = "state `{Self}` has no transition for event `{E}`",
+    label = "`{Self}` cannot record `{E}`",
+    note = "add `{E} => ...` to {Self}'s #[state(on(...))], or record `{E}` after an event that \
+            moves to a state that has it"
+)]
+pub trait On<E>: State {
+    /// The state `E` moves to: the state named after `=>`.
+    type To: State<Aggregate = Self::Aggregate>;
+}
 
 /// How a state decides command `C`. Implement it for each command listed in the state's
 /// `accepts(...)`.
-pub trait Handle<C>: State {
+///
+/// Build the events with the state's `emit` method and [`Emitted::then`]. Each event must
+/// have a transition from the state the previous events moved to, which the compiler checks,
+/// so `decide` can never record an event the aggregate cannot apply. At least one event is
+/// required; to refuse a command, return a rejection.
+pub trait Handle<C>: Accepts<C> {
     /// Pure: the events to record, or a rejection.
-    fn decide(&self, command: &C) -> Result<Vec<EventOf<Self>>, RejectionOf<Self>>;
+    fn decide(&self, command: &C) -> Decision<Self>;
 }
 
 /// How event `E` moves a state to the next one. Implement it for each `E => To` listed in the
-/// state's `on(...)`.
-pub trait Transition<E>: State {
-    /// The next state. Must be the state named after `=>`.
-    type To;
+/// state's `on(...)`; the table fixes the next state.
+pub trait Transition<E>: On<E> {
     /// Pure and infallible: the next state.
     fn evolve(self, event: &E) -> Self::To;
+}
+
+/// Events emitted while deciding a command in state `S`, which have moved the aggregate to
+/// state `At`. Start one with the state's `emit` method; add more with [`then`](Self::then);
+/// finish with `.into()`.
+#[must_use = "return it from `decide` with `Ok(...into())`"]
+pub struct Emitted<S: State, At> {
+    events: Vec<EventOf<S>>,
+    states: core::marker::PhantomData<fn() -> (S, At)>,
+}
+
+impl<S: State, At: State> Emitted<S, At> {
+    /// Records `event` after the previous ones. Compiles only when state `At` has a
+    /// transition for `E`.
+    pub fn then<E>(mut self, event: E) -> Emitted<S, <At as On<E>>::To>
+    where
+        At: On<E>,
+        E: Into<EventOf<S>>,
+    {
+        self.events.push(event.into());
+        Emitted { events: self.events, states: core::marker::PhantomData }
+    }
+}
+
+/// The events a state decided to record: at least one, each valid after the ones before it.
+/// Only [`Emitted`] produces it.
+pub struct Events<S: State> {
+    events: Vec<EventOf<S>>,
+}
+
+impl<S: State, At: State> From<Emitted<S, At>> for Events<S> {
+    fn from(emitted: Emitted<S, At>) -> Self {
+        Events { events: emitted.events }
+    }
+}
+
+impl<S: State> Events<S> {
+    /// The events, in the order they were emitted.
+    pub fn into_vec(self) -> Vec<EventOf<S>> {
+        self.events
+    }
 }
 
 /// The rejection for a command the current state does not accept.
@@ -225,4 +291,12 @@ pub mod __private {
 
     /// The serde the attribute macros derive with, so user crates need no serde dependency.
     pub use serde;
+
+    use crate::{Emitted, EventOf, On};
+
+    /// Starts the events a state emits. Called by the `emit` method `#[oath::aggregate]`
+    /// gives each state.
+    pub fn emit<S: On<E>, E: Into<EventOf<S>>>(event: E) -> Emitted<S, <S as On<E>>::To> {
+        Emitted::<S, S> { events: Vec::new(), states: core::marker::PhantomData }.then(event)
+    }
 }

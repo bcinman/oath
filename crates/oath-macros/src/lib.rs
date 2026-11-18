@@ -583,14 +583,39 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     let mut decide_arms = Vec::new();
     let mut evolve_arms = Vec::new();
     let mut edges = Vec::new();
+    // The transition table as marker impls. `Handle` and `Transition` require them, so an impl
+    // the table doesn't list doesn't compile, and `emit`/`then` check each event against them.
+    let mut markers = Vec::new();
     for (state, spec) in states.iter().zip(&specs) {
         for accepted in &spec.accepts {
             decide_arms.push(quote! {
                 (Self::#state(state), #command::#accepted(command)) =>
-                    <#state as ::oath::Handle<#accepted>>::decide(state, command),
+                    <#state as ::oath::Handle<#accepted>>::decide(state, command)
+                        .map(::oath::Events::into_vec),
+            });
+            markers.push(quote! { impl ::oath::Accepts<#accepted> for #state {} });
+        }
+        if !spec.on.is_empty() {
+            markers.push(quote! {
+                impl #state {
+                    /// Starts the events this state records. Compiles only when this state has
+                    /// a transition for `E`.
+                    #[allow(dead_code)]
+                    pub(crate) fn emit<E>(
+                        &self,
+                        event: E,
+                    ) -> ::oath::Emitted<Self, <Self as ::oath::On<E>>::To>
+                    where
+                        Self: ::oath::On<E>,
+                        E: ::core::convert::Into<::oath::EventOf<Self>>,
+                    {
+                        ::oath::__private::emit(event)
+                    }
+                }
             });
         }
         for (on, to) in &spec.on {
+            markers.push(quote! { impl ::oath::On<#on> for #state { type To = #to; } });
             evolve_arms.push(quote! {
                 (Self::#state(state), #event::#on(event)) =>
                     Self::#to(<#state as ::oath::Transition<#on>>::evolve(state, event)),
@@ -614,6 +639,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
         }
 
         #( impl ::oath::State for #states { type Aggregate = #name; } )*
+        #( #markers )*
 
         impl ::oath::Aggregate for #name {
             type Id = #id;

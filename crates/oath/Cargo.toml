@@ -1,0 +1,13 @@
+[package]
+name = "oath"
+description = "Commands, events, and state-machine aggregates for domain-driven, event-sourced Rust."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+oath-macros = { path = "../oath-macros", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

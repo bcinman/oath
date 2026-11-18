@@ -1058,6 +1058,15 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     };
     let command_enum = grouping_enum(&item.vis, &command, &commands, Kind::Command, target);
     let event_enum = grouping_enum(&item.vis, &event, &events, Kind::Event, TokenStream2::new());
+    // Each command and event belongs to this aggregate alone. A second aggregate that lists
+    // the same struct implements the trait again, which doesn't compile.
+    let aggregate_name = item.ident.clone();
+    let owned = commands.iter().chain(&events).map(|owned| {
+        quote_spanned! {owned.span()=>
+            impl ::oath::BelongsToAggregate for #owned { type Aggregate = #aggregate_name; }
+        }
+    });
+    let owned = quote!( #( #owned )* );
 
     // The aggregate is a struct with a private field holding the state enum, both defined in a
     // private module, so no code outside the generated impls can build a state without history.
@@ -1132,6 +1141,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
         type #rejection_alias = #rejection;
 
         #vis use #module::#name;
+        #owned
 
         #[doc(hidden)]
         #[allow(non_snake_case)]

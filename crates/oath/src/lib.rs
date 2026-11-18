@@ -195,6 +195,17 @@ pub trait Aggregate: Default + __private::Sealed {
     }
 }
 
+/// The one aggregate a command or event struct belongs to. Implemented by `#[oath::aggregate]`
+/// for every command and event in its transition table.
+///
+/// Each command and event belongs to exactly one aggregate's history, so two aggregates that
+/// list the same struct don't compile: the second one is a conflicting implementation of this
+/// trait. For another aggregate to react to an event, give it its own command and event.
+pub trait BelongsToAggregate {
+    /// The aggregate whose table lists this struct.
+    type Aggregate: Aggregate;
+}
+
 /// One state of an aggregate. Implemented by `#[oath::aggregate]` for each state struct.
 pub trait State: Sized {
     /// The aggregate this state belongs to.

@@ -997,6 +997,28 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
             }
         }
     }
+    // Every state must be reachable from the initial state through the transitions; a state
+    // no history can reach is dead code that reads like part of the lifecycle.
+    let mut reached = vec![initial.clone()];
+    let mut next = 0;
+    while next < reached.len() {
+        let from = states.iter().position(|state| *state == reached[next]).expect("a state");
+        for (_, to) in &specs[from].on {
+            if !reached.contains(to) {
+                reached.push(to.clone());
+            }
+        }
+        next += 1;
+    }
+    if let Some(unreached) = states.iter().find(|state| !reached.contains(state)) {
+        return Err(Error::new_spanned(
+            unreached,
+            format!(
+                "no history reaches `{unreached}` from the initial state `{initial}`; add a transition \
+                 to it in another state's #[state(on(...))], or remove it"
+            ),
+        ));
+    }
 
     // Each command and event appears once, in the order the states first list it.
     let (mut commands, mut events) = (Vec::<Ident>::new(), Vec::<Ident>::new());

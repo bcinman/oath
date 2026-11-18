@@ -19,7 +19,7 @@ pub struct Placed { total: u64 }
 pub struct Paid { amount: u64 }
 pub struct Cancelled;
 
-#[oath::aggregate(id = OrderId, command = OrderCommand, event = OrderEvent, rejection = OrderRejection)]
+#[oath::aggregate(id = OrderId, rejection = OrderRejection)]
 pub enum Order {
     #[initial]
     #[state(accepts(PlaceOrder), on(OrderPlaced => Placed))]

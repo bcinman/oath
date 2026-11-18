@@ -25,8 +25,10 @@
 //!   aggregate with `#[oath::rejection]`; it adds a `NotAllowed` variant for commands the
 //!   current state does not accept.
 //! - A **context** is a bounded context: the aggregates of one domain, and the one way the
-//!   outside world reaches them. Declare it as an enum of aggregate names with
-//!   `#[oath::context]`. See [`Context`].
+//!   outside world reaches them. Declare it on a unit struct with `#[oath::context]`, listing
+//!   its aggregates and views. See [`Context`].
+//! - A **view** is a read model that the events of a context keep up to date. Declare it on a
+//!   struct with `#[oath::view(on(...))]`, naming the events it subscribes to. See [`View`].
 //!
 //! `#[oath::command]`, `#[oath::event]`, and `#[oath::rejection]` derive `Debug`, `Clone`,
 //! `PartialEq`, and serde's `Serialize` and `Deserialize`, so every command, event, and
@@ -38,7 +40,7 @@
 //! before renaming an event struct, pin its old name this way.
 //!
 //! `#[oath::aggregate]` defines the enum of the aggregate's commands and the enum of its
-//! events, under the names given in `command = ...` and `event = ...`. Each holds every
+//! events, named after the aggregate: `Order` defines `OrderCommand` and `OrderEvent`. Each holds every
 //! command its states accept and every event in their transitions, as `PlaceOrder(PlaceOrder)`,
 //! and has `From` for each struct. The aggregate's states are listed as bare names, and each
 //! name expands the same way.
@@ -72,7 +74,7 @@
 //! pub struct Placed { total: u64 }
 //! pub struct Paid;
 //!
-//! #[oath::aggregate(id = OrderId, command = OrderCommand, event = OrderEvent, rejection = OrderRejection)]
+//! #[oath::aggregate(id = OrderId, rejection = OrderRejection)]
 //! pub enum Order {
 //!     #[initial]
 //!     #[state(accepts(PlaceOrder), on(OrderPlaced => Placed))]
@@ -115,7 +117,7 @@
 //! # }
 //! ```
 
-pub use oath_macros::{aggregate, command, context, event, id, rejection, value};
+pub use oath_macros::{aggregate, command, context, event, id, rejection, value, view};
 
 /// A request to perform one business action, named in the imperative.
 ///
@@ -135,6 +137,11 @@ pub trait Command {
 ///
 /// Implemented by `#[oath::event]` on each event struct, and by `#[oath::aggregate]` on the
 /// enum of one aggregate's events. Events carry no id: they belong to their aggregate's history.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an event",
+    label = "not an event",
+    note = "declare events with #[oath::event]; a view's #[oath::view(on(...))] lists events, not commands"
+)]
 pub trait Event {
     /// The event's stable name: the struct's name, or for an enum, its variant's.
     fn name(&self) -> &'static str;
@@ -203,10 +210,16 @@ pub trait Aggregate: Default + __private::Sealed {
 /// A bounded context: the aggregates of one domain, and the one way the outside world reaches
 /// them.
 ///
-/// Implemented only by `#[oath::context]` on an enum of aggregate names, such as
-/// `#[oath::context(command = ShopCommand, event = ShopEvent, rejection = ShopRejection)]
-/// pub enum Shop { Order, Customer }`. It defines the three enums named there, with one variant
-/// per aggregate holding that aggregate's enum, such as `ShopEvent::Order(OrderEvent)`.
+/// Implemented only by `#[oath::context]` on a unit struct:
+///
+/// ```text
+/// #[oath::context(aggregates = [Order, Customer], views = [Revenue])]
+/// pub struct Shop;
+/// ```
+///
+/// It defines three enums named after the context, `ShopCommand`, `ShopEvent`, and
+/// `ShopRejection`, with one variant per aggregate holding that aggregate's enum, such as
+/// `ShopEvent::Order(OrderEvent)`. `views = [...]` may be left out.
 ///
 /// The context keeps no aggregate instance: it holds a [`Store`] of their events. Build it with
 /// `Shop::new(store)`, which takes one store that keeps the events of every aggregate the
@@ -214,7 +227,7 @@ pub trait Aggregate: Default + __private::Sealed {
 /// and a context is as visible as its aggregates.
 ///
 /// A context only decides commands: its aggregates are opaque, and it has no way to read them.
-/// Reads will come from views, which the events `send` returns keep up to date.
+/// Reads come from its [`View`]s, which `send` passes the events it records.
 ///
 /// On the wire a context's command is its aggregate's command, unchanged, such as
 /// `{"kind":"PlaceOrder","order":"ord_1"}`: its name says which aggregate decides it, so no two
@@ -237,6 +250,49 @@ pub trait Context: __private::Sealed {
     /// such as one read from the wire. A command of an aggregate outside this context doesn't
     /// compile.
     fn send(&mut self, command: impl Into<Self::Command>) -> Result<Vec<Self::Event>, Self::Rejection>;
+
+    /// The context's view `V`, holding every event `send` recorded since the context was built.
+    /// A view the context doesn't list in `views = [...]` doesn't compile.
+    fn view<V: View>(&self) -> &V
+    where
+        Self: __private::Holds<V>,
+    {
+        __private::Holds::held(self)
+    }
+}
+
+/// A read model the events of a context keep up to date. Implemented only by `#[oath::view]`
+/// on a struct with `Default`, such as `#[oath::view(on(OrderPlaced, OrderPaid))] #[derive(Default)]
+/// pub struct Revenue { placed: u64 }`, and added to a context in its `views = [...]`.
+///
+/// The view implements [`Project`] for each event in its `on(...)`, and the context passes it
+/// each of those events after `send` records it. Every event a view lists must be recorded by
+/// an aggregate in the context that lists the view, which the compiler checks.
+///
+/// A context holds its views in memory, and they start empty: a context built on a store
+/// that already holds events doesn't pass them to its views.
+pub trait View: Default + 'static + __private::Sealed {
+    #[doc(hidden)]
+    fn route(&mut self, id: &dyn core::any::Any, event: &dyn core::any::Any);
+}
+
+/// Marks that a view lists event `E` in its `on(...)`. Implemented only by `#[oath::view]`.
+#[diagnostic::on_unimplemented(
+    message = "view `{Self}` does not subscribe to event `{E}`",
+    label = "`{Self}` does not list `{E}`",
+    note = "add `{E}` to {Self}'s #[oath::view(on(...))], or remove this Project impl"
+)]
+pub trait Subscribes<E>: View {}
+
+/// How a view takes in event `E`. Implement it for each event listed in the view's `on(...)`.
+#[diagnostic::on_unimplemented(
+    message = "view `{Self}` lists event `{E}` but does not implement `Project<{E}>`",
+    label = "`{Self}` needs `impl Project<{E}>`",
+    note = "implement Project<{E}> for {Self}, or remove `{E}` from its #[oath::view(on(...))]"
+)]
+pub trait Project<E: BelongsToAggregate>: Subscribes<E> {
+    /// Updates the view with `event`, which the aggregate instance `id` recorded.
+    fn project(&mut self, id: &<E::Aggregate as Aggregate>::Id, event: &E);
 }
 
 /// The one context an aggregate belongs to. Implemented by `#[oath::context]` for every
@@ -244,6 +300,12 @@ pub trait Context: __private::Sealed {
 ///
 /// An aggregate belongs to exactly one context, so two contexts that list the same aggregate
 /// don't compile: the second one is a conflicting implementation of this trait.
+#[diagnostic::on_unimplemented(
+    message = "aggregate `{Self}` is not in this context",
+    label = "its aggregate `{Self}` is not in this context",
+    note = "a context takes commands for, and its views subscribe to events of, only the aggregates \
+            in its #[oath::context(aggregates = [...])]"
+)]
 pub trait BelongsToContext: Aggregate {
     /// The context that lists this aggregate.
     type Context: Context;
@@ -300,6 +362,11 @@ where
 /// list the same struct don't compile: the second one is a conflicting implementation of this
 /// trait. For another aggregate to react to an event, give it its own command and event.
 /// A context routes each command to its aggregate through this trait.
+#[diagnostic::on_unimplemented(
+    message = "no aggregate lists `{Self}`",
+    label = "no aggregate's #[state(...)] lists `{Self}`",
+    note = "list it in an aggregate's #[state(accepts(...))] or #[state(on(...))]"
+)]
 pub trait BelongsToAggregate {
     /// The aggregate whose table lists this struct.
     type Aggregate: Aggregate;
@@ -565,6 +632,51 @@ pub mod __private {
             i += 1;
         }
         true
+    }
+
+    /// The views of a context: one impl per view in its `views = [...]`.
+    #[diagnostic::on_unimplemented(
+        message = "`{V}` is not a view of `{Self}`",
+        label = "`{Self}` does not list `{V}`",
+        note = "add `{V}` to the `views = [...]` of {Self}'s #[oath::context]"
+    )]
+    pub trait Holds<V> {
+        fn held(&self) -> &V;
+    }
+
+    /// An event a view can subscribe to in context `C`: one an aggregate in `C` records.
+    #[diagnostic::on_unimplemented(
+        message = "no aggregate in `{C}` records event `{Self}`",
+        label = "`{Self}` is not an event of `{C}`",
+        note = "a view subscribes only to events in the #[state(on(...))] of an aggregate its context lists"
+    )]
+    pub trait EventIn<C> {}
+    impl<E, C> EventIn<C> for E
+    where
+        E: crate::Event + crate::BelongsToAggregate,
+        E::Aggregate: crate::BelongsToContext<Context = C>,
+    {
+    }
+
+    /// A view whose every event is one an aggregate in context `C` records.
+    #[diagnostic::on_unimplemented(
+        message = "view `{Self}` subscribes to an event no aggregate in `{C}` records",
+        label = "`{Self}` listens for an event outside `{C}`"
+    )]
+    pub trait RecordedIn<C> {}
+
+    /// The event struct inside one variant of an aggregate's event enum.
+    pub trait Inner {
+        fn inner(&self) -> &dyn core::any::Any;
+    }
+
+    /// Passes `event`, which instance `id` of aggregate `A` recorded, to `view`.
+    pub fn route<A: crate::Aggregate, V: crate::View>(view: &mut V, id: &A::Id, event: &A::Event)
+    where
+        A::Id: 'static,
+        A::Event: Inner,
+    {
+        view.route(id, event.inner());
     }
 
     /// Replays the instance `command` targets from `store`, lets it decide, and appends the

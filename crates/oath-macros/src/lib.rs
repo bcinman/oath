@@ -1,6 +1,6 @@
 //! Attribute macros for the `oath` crate. Use them through `oath`: `#[oath::command]`,
 //! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, `#[oath::value]`,
-//! `#[oath::aggregate(...)]`, and `#[oath::context(...)]`.
+//! `#[oath::aggregate(...)]`, `#[oath::context(...)]`, and `#[oath::view(...)]`.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
@@ -51,10 +51,16 @@ pub fn aggregate(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(aggregate_impl(args.into(), item.into()))
 }
 
-/// Declares a bounded context: an enum of the aggregates it holds.
+/// Declares a bounded context on a unit struct, listing its aggregates and views.
 #[proc_macro_attribute]
 pub fn context(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(context_impl(args.into(), item.into()))
+}
+
+/// Declares a view: a struct the events listed in `on(...)` keep up to date.
+#[proc_macro_attribute]
+pub fn view(args: TokenStream, item: TokenStream) -> TokenStream {
+    expand(view_impl(args.into(), item.into()))
 }
 
 fn expand(result: Result<TokenStream2>) -> TokenStream {
@@ -666,7 +672,18 @@ fn grouping_enum(
         }
     });
     let serde = quote!(::oath::__private::serde);
+    let inner = match kind {
+        Kind::Event => quote! {
+            impl ::oath::__private::Inner for #name {
+                fn inner(&self) -> &dyn ::core::any::Any {
+                    match self { #( Self::#names(inner) => inner, )* }
+                }
+            }
+        },
+        _ => TokenStream2::new(),
+    };
     quote! {
+        #inner
         #[doc = #doc]
         #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq)]
         #vis enum #name { #( #names(#names), )* }
@@ -834,31 +851,21 @@ fn rejection_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 
 struct AggregateArgs {
     id: Type,
-    command: Ident,
-    event: Ident,
     rejection: Type,
 }
 
 impl Parse for AggregateArgs {
     fn parse(input: ParseStream) -> Result<Self> {
-        let (mut id, mut command, mut event, mut rejection) = (None, None, None, None);
+        let (mut id, mut rejection) = (None, None);
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "id" if id.is_none() => id = Some(input.parse()?),
-                "command" if command.is_none() => command = Some(enum_name(input)?),
-                "event" if event.is_none() => event = Some(enum_name(input)?),
                 "rejection" if rejection.is_none() => rejection = Some(input.parse()?),
-                "id" | "command" | "event" | "rejection" => {
-                    return Err(Error::new_spanned(key, "given twice"));
-                }
-                _ => {
-                    return Err(Error::new_spanned(
-                        key,
-                        "expected `id = ...`, `command = ...`, `event = ...`, or `rejection = ...`",
-                    ));
-                }
+                "id" | "rejection" => return Err(Error::new_spanned(key, "given twice")),
+                "command" | "event" => return Err(derived_name(&key, "#[oath::aggregate]", "Order")),
+                _ => return Err(Error::new_spanned(key, "expected `id = ...` or `rejection = ...`")),
             }
             if !input.is_empty() {
                 input.parse::<Token![,]>()?;
@@ -868,16 +875,30 @@ impl Parse for AggregateArgs {
             Error::new(
                 Span::call_site(),
                 format!("#[oath::aggregate] needs `{what} = ...`; expected \
-                         #[oath::aggregate(id = ..., command = ..., event = ..., rejection = ...)]"),
+                         #[oath::aggregate(id = ..., rejection = ...)]"),
             )
         };
         Ok(AggregateArgs {
             id: id.ok_or_else(|| missing("id"))?,
-            command: command.ok_or_else(|| missing("command"))?,
-            event: event.ok_or_else(|| missing("event"))?,
             rejection: rejection.ok_or_else(|| missing("rejection"))?,
         })
     }
+}
+
+/// The error for naming an enum the macro names itself, after the type it is on.
+fn derived_name(key: &Ident, attribute: &str, example: &str) -> Error {
+    let suffix = match key.to_string().as_str() {
+        "command" => "Command",
+        "event" => "Event",
+        _ => "Rejection",
+    };
+    Error::new_spanned(
+        key,
+        format!(
+            "remove `{key} = ...`: {attribute} names this enum after the type it is on, such as \
+             `{example}{suffix}` for `{example}`"
+        ),
+    )
 }
 
 /// The same visibility as `vis`, written for an item one module further down.
@@ -897,14 +918,6 @@ fn vis_one_level_down(vis: &Visibility) -> TokenStream2 {
         }
         Visibility::Public(_) => quote!(#vis),
     }
-}
-
-/// The name of an enum `#[oath::aggregate]` defines: a plain name, not a path.
-fn enum_name(input: ParseStream) -> Result<Ident> {
-    let path: Path = input.parse()?;
-    path.get_ident().cloned().ok_or_else(|| {
-        Error::new_spanned(path, "name the enum to define here, such as `OrderCommand`, not a path")
-    })
 }
 
 #[derive(Default)]
@@ -963,11 +976,13 @@ impl Parse for StateSpec {
 }
 
 fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
-    let AggregateArgs { id, command, event, rejection } = syn::parse2(args)?;
+    let AggregateArgs { id, rejection } = syn::parse2(args)?;
     let mut item: ItemEnum = syn::parse2(item).map_err(|error| {
         Error::new(error.span(), "#[oath::aggregate] goes on an enum of state names")
     })?;
     reject_generics(&item.generics, "#[oath::aggregate]")?;
+    let command = format_ident!("{}Command", item.ident);
+    let event = format_ident!("{}Event", item.ident);
 
     let mut initial: Option<Ident> = None;
     let mut specs = Vec::new();
@@ -1237,32 +1252,41 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 // #[oath::context]
 
 struct ContextArgs {
-    command: Ident,
-    event: Ident,
-    rejection: Ident,
+    aggregates: Vec<Ident>,
+    views: Vec<Ident>,
+}
+
+/// A list of type names, such as `[Order, Customer]`; each name once.
+fn name_list(input: ParseStream, noun: &str) -> Result<Vec<Ident>> {
+    let content;
+    syn::bracketed!(content in input);
+    let mut names: Vec<Ident> = Vec::new();
+    for name in Punctuated::<Ident, Token![,]>::parse_terminated(&content)? {
+        if names.contains(&name) {
+            return Err(Error::new_spanned(name, format!("{noun} listed twice")));
+        }
+        names.push(name);
+    }
+    Ok(names)
 }
 
 impl Parse for ContextArgs {
     fn parse(input: ParseStream) -> Result<Self> {
-        let (mut command, mut event, mut rejection) = (None, None, None);
+        let (mut aggregates, mut views) = (None, None);
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
-            let slot = match key.to_string().as_str() {
-                "command" => &mut command,
-                "event" => &mut event,
-                "rejection" => &mut rejection,
-                _ => {
-                    return Err(Error::new_spanned(
-                        key,
-                        "expected `command = ...`, `event = ...`, or `rejection = ...`",
-                    ));
+            match key.to_string().as_str() {
+                "aggregates" if aggregates.is_none() => aggregates = Some(name_list(input, "aggregate")?),
+                "views" if views.is_none() => views = Some(name_list(input, "view")?),
+                "aggregates" | "views" => return Err(Error::new_spanned(key, "given twice")),
+                "command" | "event" | "rejection" => {
+                    return Err(derived_name(&key, "#[oath::context]", "Shop"));
                 }
-            };
-            if slot.is_some() {
-                return Err(Error::new_spanned(key, "given twice"));
+                _ => {
+                    return Err(Error::new_spanned(key, "expected `aggregates = [...]` or `views = [...]`"));
+                }
             }
-            *slot = Some(enum_name(input)?);
             if !input.is_empty() {
                 input.parse::<Token![,]>()?;
             }
@@ -1270,34 +1294,39 @@ impl Parse for ContextArgs {
         let missing = |what: &str| {
             Error::new(
                 Span::call_site(),
-                format!("#[oath::context] needs `{what} = ...`; expected \
-                         #[oath::context(command = ..., event = ..., rejection = ...)]"),
+                format!("#[oath::context] needs {what}; expected \
+                         #[oath::context(aggregates = [...], views = [...])]"),
             )
         };
+        let aggregates = aggregates.ok_or_else(|| missing("`aggregates = [...]`"))?;
+        if aggregates.is_empty() {
+            return Err(missing("at least one aggregate in `aggregates = [...]`"));
+        }
         Ok(ContextArgs {
-            command: command.ok_or_else(|| missing("command"))?,
-            event: event.ok_or_else(|| missing("event"))?,
-            rejection: rejection.ok_or_else(|| missing("rejection"))?,
+            aggregates,
+            views: views.unwrap_or_default(),
         })
     }
 }
 
 fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
-    let ContextArgs { command, event, rejection } = syn::parse2(args)?;
-    let mut item: ItemEnum = syn::parse2(item).map_err(|error| {
-        Error::new(error.span(), "#[oath::context] goes on an enum of aggregate names")
+    let ContextArgs { aggregates, views } = syn::parse2(args)?;
+    let item: ItemStruct = syn::parse2(item).map_err(|error| {
+        Error::new(error.span(), "#[oath::context] goes on a unit struct, such as `pub struct Shop;`")
     })?;
-    reject_generics(&item.generics, "#[oath::context]")?;
-    if let Some(attr) = item.variants.iter().flat_map(|variant| &variant.attrs).next() {
-        return Err(Error::new_spanned(attr, "list each aggregate by its name alone"));
-    }
-    let aggregates = wrap_variants(&mut item, "aggregate")?;
-    for (i, aggregate) in aggregates.iter().enumerate() {
-        if aggregates[..i].contains(aggregate) {
-            return Err(Error::new_spanned(aggregate, "aggregate listed twice"));
-        }
+    if !matches!(item.fields, Fields::Unit) || !item.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &item,
+            "#[oath::context] goes on a unit struct, such as `pub struct Shop;`; list its \
+             aggregates and views in `aggregates = [...]` and `views = [...]`",
+        ));
     }
     let name = item.ident.clone();
+    let (command, event, rejection) = (
+        format_ident!("{}Command", name),
+        format_ident!("{}Event", name),
+        format_ident!("{}Rejection", name),
+    );
     let vis = item.vis.clone();
     let inner_vis = vis_one_level_down(&vis);
     let module = format_ident!("__oath_{}", name);
@@ -1310,8 +1339,34 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
     let stores = quote!( #( ::oath::Store<#aggregates> + )* ::core::marker::Send + ::core::marker::Sync );
     let new_doc = format!(
         "A {name} that keeps the events of its aggregates in `store`, which implements \
-         [`Store`](::oath::Store) for each of them."
+         [`Store`](::oath::Store) for each of them. Its views start empty."
     );
+    let view_indices: Vec<_> = (0..views.len()).map(syn::Index::from).collect();
+    // Each command goes to its aggregate, and each event it records to every view, which
+    // keeps the events it subscribes to.
+    let send_arms = aggregates.iter().map(|aggregate| {
+        quote! {
+            #command::#aggregate(command) => {
+                let events = ::oath::__private::send::<#aggregate, _>(&mut *self.store, &command)
+                    .map_err(#rejection::#aggregate)?;
+                let target = ::oath::Command::target(&command);
+                for event in &events {
+                    #( ::oath::__private::route::<#aggregate, _>(&mut self.views.#view_indices, target, event); )*
+                }
+                ::core::result::Result::Ok(events.into_iter().map(#event::#aggregate).collect())
+            }
+        }
+    });
+    // Each view checks, at the context, that every event it subscribes to is recorded by an
+    // aggregate the context lists.
+    let recorded = views.iter().map(|view| {
+        quote_spanned! {view.span()=>
+            const _: fn() = || {
+                fn recorded_in<V: ::oath::__private::RecordedIn<#name>>() {}
+                recorded_in::<#view>();
+            };
+        }
+    });
 
     // A command reaches the context by its name alone, so no two aggregates' commands share one.
     let pairs = aggregates.iter().enumerate().flat_map(|(i, a)| aggregates[i + 1..].iter().map(move |b| (a, b)));
@@ -1409,9 +1464,10 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
         #vis enum #rejection { #( #aggregates(#rejection_types), )* }
 
         #vis use #module::#name;
+        #( #recorded )*
 
-        // The context is a struct with a private field holding its store, defined in a private
-        // module, so no code but `send` can append events.
+        // The context is a struct with private fields holding its store and its views, defined
+        // in a private module, so no code but `send` can append events or change a view.
         #[doc(hidden)]
         #[allow(non_snake_case)]
         mod #module {
@@ -1421,14 +1477,26 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
             impl<S: #stores> #store_trait for S {}
 
             #( #struct_attrs )*
-            #inner_vis struct #name(::std::boxed::Box<dyn #store_trait>);
+            #inner_vis struct #name {
+                store: ::std::boxed::Box<dyn #store_trait>,
+                views: ( #( #views, )* ),
+            }
 
             impl #name {
                 #[doc = #new_doc]
                 pub fn new(store: impl #stores + 'static) -> Self {
-                    Self(::std::boxed::Box::new(store))
+                    Self {
+                        store: ::std::boxed::Box::new(store),
+                        views: ( #( <#views as ::core::default::Default>::default(), )* ),
+                    }
                 }
             }
+
+            #(
+                impl ::oath::__private::Holds<#views> for #name {
+                    fn held(&self) -> &#views { &self.views.#view_indices }
+                }
+            )*
 
             impl ::oath::__private::Sealed for #name {}
 
@@ -1441,14 +1509,7 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                     &mut self,
                     command: impl ::core::convert::Into<#command>,
                 ) -> ::core::result::Result<::std::vec::Vec<#event>, #rejection> {
-                    match command.into() {
-                        #(
-                            #command::#aggregates(command) =>
-                                ::oath::__private::send::<#aggregates, _>(&mut *self.0, &command)
-                                    .map(|events| events.into_iter().map(#event::#aggregates).collect())
-                                    .map_err(#rejection::#aggregates),
-                        )*
-                    }
+                    match command.into() { #( #send_arms )* }
                 }
             }
 
@@ -1458,5 +1519,75 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                 }
             )*
         }
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// #[oath::view]
+
+/// The `on(Event, ...)` of `#[oath::view]`.
+struct ViewArgs(Vec<Ident>);
+
+impl Parse for ViewArgs {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let key: Ident = input.parse()?;
+        if key != "on" {
+            return Err(Error::new_spanned(key, "expected `on(Event, ...)`"));
+        }
+        let content;
+        parenthesized!(content in input);
+        let mut events: Vec<Ident> = Vec::new();
+        for event in Punctuated::<Ident, Token![,]>::parse_terminated(&content)? {
+            if events.contains(&event) {
+                return Err(Error::new_spanned(event, "event listed twice"));
+            }
+            events.push(event);
+        }
+        if events.is_empty() {
+            return Err(Error::new_spanned(key, "list at least one event in `on(...)`"));
+        }
+        if !input.is_empty() {
+            input.parse::<Token![,]>()?;
+        }
+        if !input.is_empty() {
+            return Err(input.error("expected only `on(Event, ...)`"));
+        }
+        Ok(ViewArgs(events))
+    }
+}
+
+fn view_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
+    if args.is_empty() {
+        return Err(Error::new(Span::call_site(), "#[oath::view] needs `on(Event, ...)`"));
+    }
+    let ViewArgs(events) = syn::parse2(args)?;
+    let item: ItemStruct = syn::parse2(item)
+        .map_err(|error| Error::new(error.span(), "#[oath::view] goes on a struct"))?;
+    if !item.generics.params.is_empty() {
+        return Err(Error::new_spanned(&item.generics, "#[oath::view] does not support generics"));
+    }
+    let name = &item.ident;
+    // Each bound carries its event's span, so an event the context's aggregates don't record
+    // is reported at that event in `on(...)`.
+    let recorded = events.iter().map(|event| {
+        quote_spanned! {event.span()=> #event: ::oath::__private::EventIn<C>, }
+    });
+    Ok(quote! {
+        #item
+        impl ::oath::__private::Sealed for #name {}
+        impl ::oath::View for #name {
+            fn route(&mut self, id: &dyn ::core::any::Any, event: &dyn ::core::any::Any) {
+                #(
+                    if let ::core::option::Option::Some(event) = event.downcast_ref::<#events>() {
+                        let id = id
+                            .downcast_ref::<<<#events as ::oath::BelongsToAggregate>::Aggregate as ::oath::Aggregate>::Id>()
+                            .expect("an event comes with the id of the aggregate that records it");
+                        return <Self as ::oath::Project<#events>>::project(self, id, event);
+                    }
+                )*
+            }
+        }
+        #( impl ::oath::Subscribes<#events> for #name {} )*
+        impl<C> ::oath::__private::RecordedIn<C> for #name where #( #recorded )* {}
     })
 }

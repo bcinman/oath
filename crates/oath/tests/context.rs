@@ -1,4 +1,4 @@
-use oath::{Context, Decision, Handle, MemoryStore, NotAllowed, Store, Transition};
+use oath::{Context, Decision, Handle, MemoryStore, NotAllowed, Project, Store, Transition};
 
 #[oath::id(prefix = "ord_")] pub struct OrderId(String);
 #[oath::id(prefix = "cus_")] pub struct CustomerId(String);
@@ -13,7 +13,7 @@ pub struct Draft;
 pub struct Placed { total: u64 }
 pub struct Paid;
 
-#[oath::aggregate(id = OrderId, command = OrderCommand, event = OrderEvent, rejection = OrderRejection)]
+#[oath::aggregate(id = OrderId, rejection = OrderRejection)]
 pub enum Order {
     #[initial]
     #[state(accepts(PlaceOrder), on(OrderPlaced => Placed))]
@@ -50,7 +50,7 @@ impl Transition<OrderPaid> for Placed {
 pub struct New;
 pub struct Active;
 
-#[oath::aggregate(id = CustomerId, command = CustomerCommand, event = CustomerEvent, rejection = CustomerRejection)]
+#[oath::aggregate(id = CustomerId, rejection = CustomerRejection)]
 pub enum Customer {
     #[initial]
     #[state(accepts(OpenAccount), on(AccountOpened => Active))]
@@ -67,8 +67,31 @@ impl Transition<AccountOpened> for New {
     fn evolve(self, _: &AccountOpened) -> Active { Active }
 }
 
-#[oath::context(command = ShopCommand, event = ShopEvent, rejection = ShopRejection)]
-pub enum Shop { Order, Customer }
+#[oath::context(aggregates = [Order, Customer], views = [Revenue, Signups])]
+pub struct Shop;
+
+/// Money placed and paid, per order and in total.
+#[oath::view(on(OrderPlaced, OrderPaid))]
+#[derive(Default)]
+pub struct Revenue { pub placed: u64, pub paid: u64, pub orders: Vec<(OrderId, u64)> }
+
+impl Project<OrderPlaced> for Revenue {
+    fn project(&mut self, order: &OrderId, e: &OrderPlaced) {
+        self.placed += e.total;
+        self.orders.push((order.clone(), e.total));
+    }
+}
+impl Project<OrderPaid> for Revenue {
+    fn project(&mut self, _: &OrderId, e: &OrderPaid) { self.paid += e.amount; }
+}
+
+#[oath::view(on(AccountOpened))]
+#[derive(Default)]
+pub struct Signups(pub Vec<CustomerId>);
+
+impl Project<AccountOpened> for Signups {
+    fn project(&mut self, customer: &CustomerId, _: &AccountOpened) { self.0.push(customer.clone()); }
+}
 
 fn ord(id: &str) -> OrderId { OrderId::new(id).unwrap() }
 fn cus(id: &str) -> CustomerId { CustomerId::new(id).unwrap() }
@@ -166,4 +189,31 @@ fn a_memory_store_keeps_each_instance_history_in_order_and_apart() {
     let mut shop = Shop::new(store);
     assert_eq!(shop.send(PayOrder { order: ord("ord_1"), amount: 40 }), not_allowed("Paid", "PayOrder"));
     assert_eq!(shop.send(PayOrder { order: ord("ord_2"), amount: 7 }).map(|events| events.len()), Ok(1));
+}
+
+#[test]
+fn each_recorded_event_reaches_the_views_that_subscribe_to_it() {
+    let mut shop = shop();
+    shop.send(PlaceOrder { order: ord("ord_1"), total: 40 }).unwrap();
+    shop.send(PlaceOrder { order: ord("ord_2"), total: 7 }).unwrap();
+    shop.send(OpenAccount { customer: cus("cus_1") }).unwrap();
+    shop.send(PayOrder { order: ord("ord_1"), amount: 40 }).unwrap();
+    // Rejected commands record nothing, so no view sees them.
+    shop.send(PayOrder { order: ord("ord_2"), amount: 1 }).unwrap_err();
+    shop.send(OpenAccount { customer: cus("cus_1") }).unwrap_err();
+
+    let revenue = shop.view::<Revenue>();
+    assert_eq!((revenue.placed, revenue.paid), (47, 40));
+    assert_eq!(revenue.orders, [(ord("ord_1"), 40), (ord("ord_2"), 7)]);
+    assert_eq!(shop.view::<Signups>().0, [cus("cus_1")]);
+}
+
+#[test]
+fn views_start_empty_on_a_store_that_already_holds_events() {
+    let mut store = MemoryStore::default();
+    Store::<Order>::append(&mut store, &ord("ord_1"), &[OrderPlaced { total: 40 }.into()]);
+    let mut shop = Shop::new(store);
+    assert_eq!(shop.view::<Revenue>().placed, 0);
+    shop.send(PayOrder { order: ord("ord_1"), amount: 40 }).unwrap();
+    assert_eq!((shop.view::<Revenue>().placed, shop.view::<Revenue>().paid), (0, 40));
 }

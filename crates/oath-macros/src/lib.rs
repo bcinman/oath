@@ -1,5 +1,6 @@
 //! Attribute macros for the `oath` crate. Use them through `oath`: `#[oath::command]`,
-//! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, `#[oath::value]`, and `#[oath::aggregate(...)]`.
+//! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, `#[oath::value]`,
+//! `#[oath::aggregate(...)]`, and `#[oath::context(...)]`.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
@@ -48,6 +49,12 @@ pub fn rejection(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn aggregate(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(aggregate_impl(args.into(), item.into()))
+}
+
+/// Declares a bounded context: an enum of the aggregates it holds.
+#[proc_macro_attribute]
+pub fn context(args: TokenStream, item: TokenStream) -> TokenStream {
+    expand(context_impl(args.into(), item.into()))
 }
 
 fn expand(result: Result<TokenStream2>) -> TokenStream {
@@ -664,6 +671,9 @@ fn grouping_enum(
         #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq)]
         #vis enum #name { #( #names(#names), )* }
         #( #distinct )*
+        impl ::oath::__private::Names for #name {
+            const NAMES: &'static [&'static str] = &[ #( <#names as ::oath::__private::Named>::NAME ),* ];
+        }
         impl #serde::Serialize for #name {
             fn serialize<S: #serde::Serializer>(
                 &self,
@@ -1220,5 +1230,233 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
         #( impl ::oath::State for #states { type Aggregate = #name; } )*
         #( #markers )*
 
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// #[oath::context]
+
+struct ContextArgs {
+    command: Ident,
+    event: Ident,
+    rejection: Ident,
+}
+
+impl Parse for ContextArgs {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let (mut command, mut event, mut rejection) = (None, None, None);
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let slot = match key.to_string().as_str() {
+                "command" => &mut command,
+                "event" => &mut event,
+                "rejection" => &mut rejection,
+                _ => {
+                    return Err(Error::new_spanned(
+                        key,
+                        "expected `command = ...`, `event = ...`, or `rejection = ...`",
+                    ));
+                }
+            };
+            if slot.is_some() {
+                return Err(Error::new_spanned(key, "given twice"));
+            }
+            *slot = Some(enum_name(input)?);
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        let missing = |what: &str| {
+            Error::new(
+                Span::call_site(),
+                format!("#[oath::context] needs `{what} = ...`; expected \
+                         #[oath::context(command = ..., event = ..., rejection = ...)]"),
+            )
+        };
+        Ok(ContextArgs {
+            command: command.ok_or_else(|| missing("command"))?,
+            event: event.ok_or_else(|| missing("event"))?,
+            rejection: rejection.ok_or_else(|| missing("rejection"))?,
+        })
+    }
+}
+
+fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
+    let ContextArgs { command, event, rejection } = syn::parse2(args)?;
+    let mut item: ItemEnum = syn::parse2(item).map_err(|error| {
+        Error::new(error.span(), "#[oath::context] goes on an enum of aggregate names")
+    })?;
+    reject_generics(&item.generics, "#[oath::context]")?;
+    if let Some(attr) = item.variants.iter().flat_map(|variant| &variant.attrs).next() {
+        return Err(Error::new_spanned(attr, "list each aggregate by its name alone"));
+    }
+    let aggregates = wrap_variants(&mut item, "aggregate")?;
+    for (i, aggregate) in aggregates.iter().enumerate() {
+        if aggregates[..i].contains(aggregate) {
+            return Err(Error::new_spanned(aggregate, "aggregate listed twice"));
+        }
+    }
+    let name = item.ident.clone();
+    let vis = item.vis.clone();
+    let inner_vis = vis_one_level_down(&vis);
+    let module = format_ident!("__oath_{}", name);
+    let serde = quote!(::oath::__private::serde);
+    let commands_of = |aggregate: &Ident| quote!(<#aggregate as ::oath::Aggregate>::Command);
+    let command_types: Vec<_> = aggregates.iter().map(commands_of).collect();
+    let event_types = aggregates.iter().map(|a| quote!(<#a as ::oath::Aggregate>::Event));
+    let rejection_types = aggregates.iter().map(|a| quote!(<#a as ::oath::Aggregate>::Rejection));
+    let store_trait = format_ident!("__{}Store", name);
+    let stores = quote!( #( ::oath::Store<#aggregates> + )* ::core::marker::Send + ::core::marker::Sync );
+    let new_doc = format!(
+        "A {name} that keeps the events of its aggregates in `store`, which implements \
+         [`Store`](::oath::Store) for each of them."
+    );
+
+    // A command reaches the context by its name alone, so no two aggregates' commands share one.
+    let pairs = aggregates.iter().enumerate().flat_map(|(i, a)| aggregates[i + 1..].iter().map(move |b| (a, b)));
+    let distinct = pairs.map(|(a, b)| {
+        let message = format!(
+            "`{a}` and `{b}` both have a command with the same name, and {name} routes commands by \
+             name; give one `name = \"...\"`"
+        );
+        let (a_commands, b_commands) = (commands_of(a), commands_of(b));
+        quote_spanned! {b.span()=>
+            const _: () = ::core::assert!(
+                ::oath::__private::disjoint(
+                    <#a_commands as ::oath::__private::Names>::NAMES,
+                    <#b_commands as ::oath::__private::Names>::NAMES,
+                ),
+                #message,
+            );
+        }
+    });
+    let unknown = format!("no aggregate in {name} has a command named `{{}}`");
+    let (command_doc, event_doc, rejection_doc) = (
+        format!("The commands of every aggregate in {name}. Defined by `#[oath::context]`."),
+        format!("The events of every aggregate in {name}. Defined by `#[oath::context]`."),
+        format!("The rejections of every aggregate in {name}. Defined by `#[oath::context]`."),
+    );
+    let struct_attrs = &item.attrs;
+
+    Ok(quote! {
+        #[doc = #command_doc]
+        #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq)]
+        #vis enum #command { #( #aggregates(#command_types), )* }
+        #( #distinct )*
+        #(
+            impl ::core::convert::From<#command_types> for #command {
+                fn from(inner: #command_types) -> Self { Self::#aggregates(inner) }
+            }
+        )*
+        impl<C> ::core::convert::From<C> for #command
+        where
+            C: ::oath::BelongsToAggregate
+                + ::core::convert::Into<<C::Aggregate as ::oath::Aggregate>::Command>,
+            C::Aggregate: ::oath::BelongsToContext<Context = #name>,
+            #command: ::core::convert::From<<C::Aggregate as ::oath::Aggregate>::Command>,
+        {
+            fn from(inner: C) -> Self {
+                let inner: <C::Aggregate as ::oath::Aggregate>::Command = inner.into();
+                ::core::convert::From::from(inner)
+            }
+        }
+        // On the wire a command is its aggregate's command, unchanged: its name routes it.
+        impl #serde::Serialize for #command {
+            fn serialize<S: #serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> ::core::result::Result<S::Ok, S::Error> {
+                match self { #( Self::#aggregates(inner) => #serde::Serialize::serialize(inner, serializer), )* }
+            }
+        }
+        impl<'de> #serde::Deserialize<'de> for #command {
+            fn deserialize<D: #serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> ::core::result::Result<Self, D::Error> {
+                let (kind, fields) = ::oath::__private::read_tagged(deserializer)?;
+                #(
+                    if <#command_types as ::oath::__private::Names>::NAMES.contains(&kind.as_str()) {
+                        return ::oath::__private::retagged(kind, fields).map(Self::#aggregates);
+                    }
+                )*
+                ::core::result::Result::Err(<D::Error as #serde::de::Error>::custom(
+                    ::std::format!(#unknown, kind),
+                ))
+            }
+        }
+
+        #[doc = #event_doc]
+        #[derive(
+            ::core::fmt::Debug,
+            ::core::clone::Clone,
+            ::core::cmp::PartialEq,
+            #serde::Serialize,
+            #serde::Deserialize,
+        )]
+        #[serde(crate = "::oath::__private::serde")]
+        #vis enum #event { #( #aggregates(#event_types), )* }
+
+        #[doc = #rejection_doc]
+        #[derive(
+            ::core::fmt::Debug,
+            ::core::clone::Clone,
+            ::core::cmp::PartialEq,
+            #serde::Serialize,
+            #serde::Deserialize,
+        )]
+        #[serde(crate = "::oath::__private::serde")]
+        #vis enum #rejection { #( #aggregates(#rejection_types), )* }
+
+        #vis use #module::#name;
+
+        // The context is a struct with a private field holding its store, defined in a private
+        // module, so no code but `send` can append events.
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        mod #module {
+            use super::*;
+
+            trait #store_trait: #stores {}
+            impl<S: #stores> #store_trait for S {}
+
+            #( #struct_attrs )*
+            #inner_vis struct #name(::std::boxed::Box<dyn #store_trait>);
+
+            impl #name {
+                #[doc = #new_doc]
+                pub fn new(store: impl #stores + 'static) -> Self {
+                    Self(::std::boxed::Box::new(store))
+                }
+            }
+
+            impl ::oath::__private::Sealed for #name {}
+
+            impl ::oath::Context for #name {
+                type Command = #command;
+                type Event = #event;
+                type Rejection = #rejection;
+
+                fn send(
+                    &mut self,
+                    command: impl ::core::convert::Into<#command>,
+                ) -> ::core::result::Result<::std::vec::Vec<#event>, #rejection> {
+                    match command.into() {
+                        #(
+                            #command::#aggregates(command) =>
+                                ::oath::__private::send::<#aggregates, _>(&mut *self.0, &command)
+                                    .map(|events| events.into_iter().map(#event::#aggregates).collect())
+                                    .map_err(#rejection::#aggregates),
+                        )*
+                    }
+                }
+            }
+
+            #(
+                impl ::oath::BelongsToContext for #aggregates {
+                    type Context = #name;
+                }
+            )*
+        }
     })
 }

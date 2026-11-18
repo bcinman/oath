@@ -24,6 +24,9 @@
 //! - A **rejection** says why an aggregate refused a command. Declare one enum of reasons per
 //!   aggregate with `#[oath::rejection]`; it adds a `NotAllowed` variant for commands the
 //!   current state does not accept.
+//! - A **context** is a bounded context: the aggregates of one domain, and the one way the
+//!   outside world reaches them. Declare it as an enum of aggregate names with
+//!   `#[oath::context]`. See [`Context`].
 //!
 //! `#[oath::command]`, `#[oath::event]`, and `#[oath::rejection]` derive `Debug`, `Clone`,
 //! `PartialEq`, and serde's `Serialize` and `Deserialize`, so every command, event, and
@@ -112,7 +115,7 @@
 //! # }
 //! ```
 
-pub use oath_macros::{aggregate, command, event, id, rejection, value};
+pub use oath_macros::{aggregate, command, context, event, id, rejection, value};
 
 /// A request to perform one business action, named in the imperative.
 ///
@@ -197,12 +200,106 @@ pub trait Aggregate: Default + __private::Sealed {
     }
 }
 
+/// A bounded context: the aggregates of one domain, and the one way the outside world reaches
+/// them.
+///
+/// Implemented only by `#[oath::context]` on an enum of aggregate names, such as
+/// `#[oath::context(command = ShopCommand, event = ShopEvent, rejection = ShopRejection)]
+/// pub enum Shop { Order, Customer }`. It defines the three enums named there, with one variant
+/// per aggregate holding that aggregate's enum, such as `ShopEvent::Order(OrderEvent)`.
+///
+/// The context keeps no aggregate instance: it holds a [`Store`] of their events. Build it with
+/// `Shop::new(store)`, which takes one store that keeps the events of every aggregate the
+/// context lists, such as a [`MemoryStore`]. Each aggregate belongs to exactly one context,
+/// and a context is as visible as its aggregates.
+///
+/// A context only decides commands: its aggregates are opaque, and it has no way to read them.
+/// Reads will come from views, which the events `send` returns keep up to date.
+///
+/// On the wire a context's command is its aggregate's command, unchanged, such as
+/// `{"kind":"PlaceOrder","order":"ord_1"}`: its name says which aggregate decides it, so no two
+/// aggregates in one context may have a command with the same name. Events and rejections go
+/// under their aggregate's name, such as `{"Order":{"kind":"OrderPlaced","total":40}}`, since
+/// every aggregate has a `NotAllowed` rejection.
+pub trait Context: __private::Sealed {
+    /// The enum of every command the context's aggregates decide.
+    type Command;
+    /// The enum of every event the context's aggregates record.
+    type Event;
+    /// The enum of every reason the context's aggregates reject a command for.
+    type Rejection;
+
+    /// Routes `command` to the aggregate instance it targets: replays that instance's events
+    /// from the store, lets it decide, and appends the events it records, which are returned.
+    /// A rejection appends nothing.
+    ///
+    /// Takes a command struct, an aggregate's command enum, or the context's own command enum,
+    /// such as one read from the wire. A command of an aggregate outside this context doesn't
+    /// compile.
+    fn send(&mut self, command: impl Into<Self::Command>) -> Result<Vec<Self::Event>, Self::Rejection>;
+}
+
+/// The one context an aggregate belongs to. Implemented by `#[oath::context]` for every
+/// aggregate it lists.
+///
+/// An aggregate belongs to exactly one context, so two contexts that list the same aggregate
+/// don't compile: the second one is a conflicting implementation of this trait.
+pub trait BelongsToContext: Aggregate {
+    /// The context that lists this aggregate.
+    type Context: Context;
+}
+
+/// Where a context keeps the events of aggregate `A`, by instance id. The events are the
+/// only record of an instance: its state is replayed from them.
+pub trait Store<A: Aggregate> {
+    /// Every event recorded for instance `id`, oldest first; empty when it has none.
+    fn load(&self, id: &A::Id) -> Vec<A::Event>;
+    /// Records `events` after the ones already recorded for instance `id`.
+    fn append(&mut self, id: &A::Id, events: &[A::Event]);
+}
+
+/// A [`Store`] that keeps every aggregate's events in memory, for tests and prototypes. Its
+/// `Default` holds no events.
+#[derive(Default)]
+pub struct MemoryStore {
+    /// One `HashMap<A::Id, Vec<A::Event>>` per aggregate `A`, keyed by `A`'s type.
+    histories: std::collections::HashMap<core::any::TypeId, Box<dyn core::any::Any + Send + Sync>>,
+}
+
+impl<A> Store<A> for MemoryStore
+where
+    A: Aggregate + 'static,
+    A::Id: Send + Sync + 'static,
+    A::Event: Clone + Send + Sync + 'static,
+{
+    fn load(&self, id: &A::Id) -> Vec<A::Event> {
+        self.histories
+            .get(&core::any::TypeId::of::<A>())
+            .and_then(|histories| histories.downcast_ref::<std::collections::HashMap<A::Id, Vec<A::Event>>>())
+            .and_then(|histories| histories.get(id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn append(&mut self, id: &A::Id, events: &[A::Event]) {
+        self.histories
+            .entry(core::any::TypeId::of::<A>())
+            .or_insert_with(|| Box::new(std::collections::HashMap::<A::Id, Vec<A::Event>>::new()))
+            .downcast_mut::<std::collections::HashMap<A::Id, Vec<A::Event>>>()
+            .expect("each aggregate's histories are keyed by its type")
+            .entry(id.clone())
+            .or_default()
+            .extend_from_slice(events);
+    }
+}
+
 /// The one aggregate a command or event struct belongs to. Implemented by `#[oath::aggregate]`
 /// for every command and event in its transition table.
 ///
 /// Each command and event belongs to exactly one aggregate's history, so two aggregates that
 /// list the same struct don't compile: the second one is a conflicting implementation of this
 /// trait. For another aggregate to react to an event, give it its own command and event.
+/// A context routes each command to its aggregate through this trait.
 pub trait BelongsToAggregate {
     /// The aggregate whose table lists this struct.
     type Aggregate: Aggregate;
@@ -447,6 +544,50 @@ pub mod __private {
             i += 1;
         }
         true
+    }
+
+    /// The stable names of the commands in one aggregate's command enum.
+    pub trait Names {
+        const NAMES: &'static [&'static str];
+    }
+
+    /// Whether two lists of names share none.
+    pub const fn disjoint(a: &[&str], b: &[&str]) -> bool {
+        let mut i = 0;
+        while i < a.len() {
+            let mut j = 0;
+            while j < b.len() {
+                if same_name(a[i], b[j]) {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Replays the instance `command` targets from `store`, lets it decide, and appends the
+    /// events it records.
+    pub fn send<A: crate::Aggregate, S: crate::Store<A> + ?Sized>(
+        store: &mut S,
+        command: &A::Command,
+    ) -> Result<Vec<A::Event>, A::Rejection> {
+        let target = crate::Command::target(command);
+        let events = A::replay(&store.load(target)).decide(command)?;
+        store.append(target, &events);
+        Ok(events)
+    }
+
+    /// Decodes the `kind` and fields [`read_tagged`] returned as the tagged enum `T`.
+    pub fn retagged<T: serde::de::DeserializeOwned, E: serde::de::Error>(
+        kind: String,
+        fields: serde_value::Value,
+    ) -> Result<T, E> {
+        use serde_value::Value;
+        let Value::Map(mut fields) = fields else { unreachable!("read_tagged returns a map") };
+        fields.insert(Value::String("kind".into()), Value::String(kind));
+        Value::Map(fields).deserialize_into().map_err(E::custom)
     }
 
     /// Starts the events a state emits. Called by the `emit` method `#[oath::aggregate]`

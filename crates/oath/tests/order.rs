@@ -1,6 +1,6 @@
 use oath::{Aggregate, Command, Decision, Edge, Event, Handle, NotAllowed, Rejection, Transition};
 
-#[oath::id] pub struct OrderId(pub String);
+#[oath::id(prefix = "ord_", len = 5..=40, chars = "a-z0-9_")] pub struct OrderId(String);
 
 #[oath::command] pub struct PlaceOrder { #[id] pub order: OrderId, pub total: u64 }
 #[oath::command] pub struct PayOrder { #[id] pub order: OrderId, pub amount: u64 }
@@ -73,7 +73,7 @@ impl Transition<OrderCancelled> for Paid {
     fn evolve(self, _: &OrderCancelled) -> Cancelled { Cancelled }
 }
 
-fn o1() -> OrderId { OrderId("o-1".into()) }
+fn o1() -> OrderId { OrderId::new("ord_1").unwrap() }
 
 /// Decides `command` against `order` and applies the resulting events.
 fn run(order: Order, command: impl Into<OrderCommand>) -> (Order, Vec<OrderEvent>) {
@@ -114,7 +114,7 @@ fn a_command_the_state_does_not_accept_is_not_allowed() {
 
 #[test]
 fn every_command_names_the_aggregate_it_targets() {
-    let o2 = || OrderId("o-2".into());
+    let o2 = || OrderId::new("ord_2").unwrap();
     let commands: [OrderCommand; 3] = [
         PlaceOrder { order: o1(), total: 40 }.into(),
         PayOrder { order: o2(), amount: 40 }.into(),
@@ -143,11 +143,11 @@ fn commands_events_and_rejections_go_over_the_wire_as_tagged_structs() {
     use serde_json::{from_str, to_string};
 
     let command: OrderCommand = PayOrder { order: o1(), amount: 40 }.into();
-    assert_eq!(to_string(&command).unwrap(), r#"{"kind":"PayOrder","order":"o-1","amount":40}"#);
-    assert_eq!(from_str::<OrderCommand>(r#"{"amount":40,"kind":"PayOrder","order":"o-1"}"#).unwrap(), command);
+    assert_eq!(to_string(&command).unwrap(), r#"{"kind":"PayOrder","order":"ord_1","amount":40}"#);
+    assert_eq!(from_str::<OrderCommand>(r#"{"amount":40,"kind":"PayOrder","order":"ord_1"}"#).unwrap(), command);
     let unit: OrderCommand = CancelOrder { order: o1() }.into();
-    assert_eq!(to_string(&unit).unwrap(), r#"{"kind":"CancelOrder","order":"o-1"}"#);
-    assert_eq!(from_str::<OrderCommand>(r#"{"kind":"CancelOrder","order":"o-1"}"#).unwrap(), unit);
+    assert_eq!(to_string(&unit).unwrap(), r#"{"kind":"CancelOrder","order":"ord_1"}"#);
+    assert_eq!(from_str::<OrderCommand>(r#"{"kind":"CancelOrder","order":"ord_1"}"#).unwrap(), unit);
 
     let (order, mut history) = run(Order::default(), PlaceOrder { order: o1(), total: 40 });
     let (order, events) = run(order, PayOrder { order: o1(), amount: 40 });

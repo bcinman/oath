@@ -1,7 +1,20 @@
 //! Commands, events, and aggregates: the core of a domain-driven, event-sourced system.
 //!
 //! - An **id** identifies one aggregate. Declare it as a branded newtype with `#[oath::id]`,
-//!   such as `struct OrderId(pub String)`.
+//!   such as `#[oath::id(prefix = "ord_")] struct OrderId(String)`.
+//! - A **value** is a domain value that keeps its rules. Declare it with `#[oath::value(...)]`
+//!   around one inner value, such as `#[oath::value(range = 0..=100)] struct Percent(u8);`,
+//!   or around named fields, such as `struct DiscountedPrice { price: Money, discount: Money }`.
+//!   Rules are checked in three layers: the inner type parses the format (`IpAddr`, `u8`);
+//!   `range`, `len`, `prefix`, and `chars` narrow it; and `check = function` covers the rest,
+//!   including rules across named fields. `range` bounds any ordered type with constants of
+//!   that type, such as `range = 0..=100` or `range = EARLIEST..` for a `const EARLIEST:
+//!   NaiveDate`; a bound that isn't a constant, such as `Utc::now()`, doesn't compile, because
+//!   a stored value must keep its rules on every replay.
+//!   A value is built only by `new`, which returns
+//!   [`Invalid`] naming the first rule it breaks, and reading it from the wire runs the same
+//!   rules. Ids take the same rules. A float value is always finite: `new` refuses NaN and
+//!   infinity, so float values have `Eq` and `Hash` like every other value.
 //! - A **command** requests a business action. Declare it as a struct with `#[oath::command]`,
 //!   and mark the field holding the id of the aggregate it targets `#[id]`.
 //! - An **event** records something that happened. Declare it as a struct with `#[oath::event]`.
@@ -41,7 +54,7 @@
 //! ```
 //! use oath::{Aggregate, Command, Decision, Handle, NotAllowed, Transition};
 //!
-//! #[oath::id] pub struct OrderId(pub String);
+//! #[oath::id(prefix = "ord_", len = 5..=40, chars = "a-z0-9_")] pub struct OrderId(String);
 //!
 //! #[oath::command] pub struct PlaceOrder { #[id] pub order: OrderId, pub total: u64 }
 //! #[oath::command] pub struct PayOrder { #[id] pub order: OrderId }
@@ -83,7 +96,7 @@
 //! }
 //!
 //! # fn main() {
-//! let id = || OrderId("o-1".into());
+//! let id = || OrderId::new("ord_1").unwrap();
 //! let place: OrderCommand = PlaceOrder { order: id(), total: 40 }.into();
 //! assert_eq!(place.target(), &id());
 //! let events = Order::default().decide(&place).unwrap();
@@ -98,7 +111,7 @@
 //! # }
 //! ```
 
-pub use oath_macros::{aggregate, command, event, id, rejection};
+pub use oath_macros::{aggregate, command, event, id, rejection, value};
 
 /// A request to perform one business action, named in the imperative.
 ///
@@ -137,7 +150,7 @@ pub trait Rejection: From<NotAllowed> {
 /// mistaken for a `CustomerId` or a plain string.
 ///
 /// Implemented by `#[oath::id]`, which derives `Debug`, `Clone`, `PartialEq`, `Eq`, `Hash`, and
-/// serde. On the wire an id is its inner value: `OrderId("o-1".into())` is `"o-1"`.
+/// serde. On the wire an id is its inner value: `OrderId::new("ord_1")?` is `"ord_1"`.
 pub trait Id:
     Clone + Eq + core::hash::Hash + core::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned
 {
@@ -288,6 +301,23 @@ pub struct NotAllowed {
     pub command: String,
 }
 
+/// Why a value was refused: its type, and the first rule it breaks, as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Invalid {
+    /// The value's type, such as `"OrderId"`.
+    pub type_name: &'static str,
+    /// The rule it breaks, such as `prefix = "ord_"`.
+    pub rule: &'static str,
+}
+
+impl core::fmt::Display for Invalid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} breaks the rule `{}`", self.type_name, self.rule)
+    }
+}
+
+impl std::error::Error for Invalid {}
+
 /// One declared transition: in state `from`, event `event` moves the aggregate to `to`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Edge {
@@ -305,6 +335,39 @@ pub mod __private {
     pub use serde;
 
     use crate::{Emitted, EventOf, On};
+
+    /// A value `len`, `prefix`, and `chars` can check.
+    #[diagnostic::on_unimplemented(
+        message = "`{Self}` is not a String: `len`, `prefix`, and `chars` only apply to String values",
+        label = "this rule needs a String inside the value"
+    )]
+    pub trait Text {
+        fn text(&self) -> &str;
+    }
+    impl Text for String {
+        fn text(&self) -> &str {
+            self
+        }
+    }
+    pub fn text<T: Text>(value: &T) -> &str {
+        value.text()
+    }
+
+    /// A value `range` can check: any ordered type.
+    #[diagnostic::on_unimplemented(
+        message = "`{Self}` has no order, so `range` can't bound it",
+        label = "this rule needs an ordered value inside",
+        note = "for a String's length, use `len`"
+    )]
+    pub trait Ordered: PartialOrd {}
+    impl<T: PartialOrd + ?Sized> Ordered for T {}
+
+    pub fn in_range<T: Ordered>(value: &T, lowest: Option<&T>, highest: Option<&T>) -> bool {
+        lowest.is_none_or(|lowest| value >= lowest) && highest.is_none_or(|highest| value <= highest)
+    }
+    pub fn len_in(len: usize, lowest: Option<usize>, highest: Option<usize>) -> bool {
+        in_range(&len, lowest.as_ref(), highest.as_ref())
+    }
     use serde::{Deserialize, Serialize};
 
     /// The stable name of a command or event struct: its wire name and `name()`.

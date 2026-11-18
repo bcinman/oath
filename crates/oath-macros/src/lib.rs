@@ -1,13 +1,14 @@
 //! Attribute macros for the `oath` crate. Use them through `oath`: `#[oath::command]`,
-//! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, and `#[oath::aggregate(...)]`.
+//! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, `#[oath::value]`, and `#[oath::aggregate(...)]`.
 
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::{
-    Attribute, Error, Fields, Ident, Item, ItemEnum, ItemStruct, LitStr, Path, Result, Token, Type,
+    Attribute, Error, Expr, Fields, Ident, Item, ItemEnum, ItemStruct, LitStr, Path, Result, Token, Type,
     Visibility, parenthesized, parse_quote,
 };
 
@@ -23,11 +24,18 @@ pub fn event(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(message(args.into(), item.into(), Kind::Event))
 }
 
-/// Declares an aggregate's identity: a branded newtype around one value, such as
-/// `struct OrderId(pub String)`.
+/// Declares an aggregate's identity: a value, as with `#[oath::value]`, that also implements
+/// `oath::Id`, such as `#[oath::id(prefix = "ord_")] struct OrderId(String);`.
 #[proc_macro_attribute]
 pub fn id(args: TokenStream, item: TokenStream) -> TokenStream {
-    expand(id_impl(args.into(), item.into()))
+    expand(value_impl(args.into(), item.into(), true))
+}
+
+/// Declares a domain value: a branded newtype around one value that keeps its rules, such as
+/// `#[oath::value(range = 0..=100)] struct Percent(u8);`.
+#[proc_macro_attribute]
+pub fn value(args: TokenStream, item: TokenStream) -> TokenStream {
+    expand(value_impl(args.into(), item.into(), false))
 }
 
 /// Declares the enum of one aggregate's rejection reasons, and adds a `NotAllowed` variant.
@@ -215,48 +223,411 @@ fn take_target_field(item: &mut ItemStruct) -> Result<(Ident, Type)> {
 // ---------------------------------------------------------------------------------------------
 // #[oath::id]
 
-fn id_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
-    if !args.is_empty() {
-        return Err(Error::new_spanned(args, "#[oath::id] takes no arguments"));
+/// `#[oath::value]` on a struct with named fields. Each field is checked by its own type; the
+/// only rule is `check`, which gets the whole value, for rules across fields.
+fn composite_value(mut item: ItemStruct, rules: Vec<Rule>) -> Result<TokenStream2> {
+    if let Some(rule) = rules.iter().find(|rule| !matches!(rule.kind, RuleKind::Check(_))) {
+        return Err(Error::new_spanned(
+            &rule.key,
+            format!(
+                "`{}` checks a single value; give the field its own value type, such as \
+                 `#[oath::value({})] struct Code(String);`, and use `check` for rules across fields",
+                rule.key, rule.text
+            ),
+        ));
     }
-    let item: ItemStruct = syn::parse2(item).map_err(|error| {
-        Error::new(error.span(), "#[oath::id] goes on a struct around one value, such as `struct OrderId(pub String);`")
+    for field in &item.fields {
+        if is_float(&field.ty) {
+            return Err(Error::new_spanned(
+                &field.ty,
+                "a field can't be a bare float, which can be NaN; give it a float value type, \
+                 such as `#[oath::value] struct Coord(f64);`, which is always finite",
+            ));
+        }
+    }
+    let name = item.ident.clone();
+    let type_name = LitStr::new(&name.to_string(), name.span());
+    let vis = std::mem::replace(&mut item.vis, Visibility::Inherited);
+    item.vis = syn::parse2(vis_one_level_down(&vis))?;
+    let module = format_ident!("__oath_{}", name);
+    let fields: Vec<_> = item.fields.iter().cloned().collect();
+    let names: Vec<_> = fields.iter().map(|field| field.ident.clone().expect("named")).collect();
+    let types: Vec<_> = fields.iter().map(|field| field.ty.clone()).collect();
+    let serde_attrs = |attrs: &[Attribute]| -> Vec<Attribute> {
+        attrs.iter().filter(|attr| attr.path().is_ident("serde")).cloned().collect()
+    };
+    let struct_serde = serde_attrs(&item.attrs);
+    let field_serde: Vec<_> = fields.iter().map(|field| serde_attrs(&field.attrs)).collect();
+    let check = rules.first().map(|Rule { text, kind, .. }| {
+        let RuleKind::Check(path) = kind else { unreachable!() };
+        quote_spanned! {path.span()=>
+            let check: fn(&#name) -> bool = #path;
+            if !check(&value) {
+                return ::core::result::Result::Err(::oath::Invalid { type_name: #type_name, rule: #text });
+            }
+        }
+    });
+    let serde = quote!(::oath::__private::serde);
+    Ok(quote! {
+        #vis use #module::#name;
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        mod #module {
+            #[allow(unused_imports)]
+            use super::*;
+
+            #[derive(
+                ::core::fmt::Debug,
+                ::core::clone::Clone,
+                ::core::cmp::PartialEq,
+                ::core::cmp::Eq,
+                ::core::hash::Hash,
+                #serde::Serialize,
+            )]
+            #[serde(crate = "::oath::__private::serde")]
+            #item
+
+            #[allow(dead_code, clippy::too_many_arguments)]
+            impl #name {
+                /// The value, if its fields keep its rule; otherwise the rule it breaks.
+                pub fn new(#( #names: #types ),*) -> ::core::result::Result<Self, ::oath::Invalid> {
+                    let value = Self { #( #names ),* };
+                    #check
+                    ::core::result::Result::Ok(value)
+                }
+
+                #(
+                    pub fn #names(&self) -> &#types {
+                        &self.#names
+                    }
+                )*
+            }
+
+            /// The fields as read from the wire, before `new` checks them.
+            #[derive(#serde::Deserialize)]
+            #[serde(crate = "::oath::__private::serde")]
+            #( #struct_serde )*
+            struct Unchecked { #( #( #field_serde )* #names: #types ),* }
+
+            // Deserializing runs the same rule as `new`.
+            impl<'de> #serde::Deserialize<'de> for #name {
+                fn deserialize<D: #serde::Deserializer<'de>>(
+                    deserializer: D,
+                ) -> ::core::result::Result<Self, D::Error> {
+                    let Unchecked { #( #names ),* } = Unchecked::deserialize(deserializer)?;
+                    Self::new(#( #names ),*).map_err(<D::Error as #serde::de::Error>::custom)
+                }
+            }
+        }
+    })
+}
+
+/// Whether `ty` is written `f32` or `f64`.
+fn is_float(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path) if path.qself.is_none()
+        && (path.path.is_ident("f32") || path.path.is_ident("f64")))
+}
+
+/// One rule of `#[oath::value(...)]` or `#[oath::id(...)]`.
+struct Rule {
+    key: Ident,
+    /// The rule as written, for `Invalid::rule`, such as `prefix = "ord_"`.
+    text: String,
+    kind: RuleKind,
+}
+
+enum RuleKind {
+    Range(Option<Expr>, Option<Expr>),
+    Len(Option<Expr>, Option<Expr>),
+    Prefix(LitStr),
+    Chars(Vec<TokenStream2>),
+    Check(Path),
+}
+
+struct Rules(Vec<Rule>);
+
+impl Parse for Rules {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let mut rules: Vec<Rule> = Vec::new();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            if rules.iter().any(|rule| rule.key == key) {
+                return Err(Error::new_spanned(key, "rule given twice"));
+            }
+            input.parse::<Token![=]>()?;
+            let (kind, text) = match key.to_string().as_str() {
+                "range" | "len" => {
+                    let (lo, hi) = bounds(input)?;
+                    let show = |e: &Option<Expr>| {
+                        e.as_ref().map(|e| quote!(#e).to_string().replace(' ', "")).unwrap_or_default()
+                    };
+                    let eq = if hi.is_some() { "=" } else { "" };
+                    let text = format!("{key} = {}..{eq}{}", show(&lo), show(&hi));
+                    let kind = if key == "range" { RuleKind::Range(lo, hi) } else { RuleKind::Len(lo, hi) };
+                    (kind, text)
+                }
+                "prefix" => {
+                    let prefix: LitStr = input.parse()?;
+                    if prefix.value().is_empty() {
+                        return Err(Error::new_spanned(prefix, "the prefix can't be empty"));
+                    }
+                    let text = format!("prefix = {:?}", prefix.value());
+                    (RuleKind::Prefix(prefix), text)
+                }
+                "chars" => {
+                    let spec: LitStr = input.parse()?;
+                    let text = format!("chars = {:?}", spec.value());
+                    (RuleKind::Chars(char_patterns(&spec)?), text)
+                }
+                "check" => {
+                    let path: Path = input.parse()?;
+                    let text = format!("check = {}", quote!(#path).to_string().replace(' ', ""));
+                    (RuleKind::Check(path), text)
+                }
+                _ => {
+                    return Err(Error::new_spanned(
+                        key,
+                        "expected `range = a..=b`, `len = a..=b`, `prefix = \"...\"`, \
+                         `chars = \"...\"`, or `check = function`",
+                    ));
+                }
+            };
+            rules.push(Rule { key, text, kind });
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        // The custom check is the last resort, so it runs after the built-in rules.
+        rules.sort_by_key(|rule| matches!(rule.kind, RuleKind::Check(_)));
+        Ok(Rules(rules))
+    }
+}
+
+/// Inclusive bounds, written `a..=b`, `a..`, or `..=b`.
+fn bounds(input: ParseStream) -> Result<(Option<Expr>, Option<Expr>)> {
+    let expr: Expr = input.parse()?;
+    let wrong = |expr: &Expr| {
+        Error::new_spanned(expr, "write the bounds as an inclusive range: `a..=b`, `a..`, or `..=b`")
+    };
+    let Expr::Range(range) = &expr else { return Err(wrong(&expr)) };
+    if matches!(range.limits, syn::RangeLimits::HalfOpen(_)) && range.end.is_some() {
+        return Err(wrong(&expr));
+    }
+    if range.start.is_none() && range.end.is_none() {
+        return Err(Error::new_spanned(&expr, "give at least one bound"));
+    }
+    Ok((range.start.as_deref().cloned(), range.end.as_deref().cloned()))
+}
+
+/// The match patterns for a `chars` spec such as `"a-z0-9_"`.
+fn char_patterns(spec: &LitStr) -> Result<Vec<TokenStream2>> {
+    let chars: Vec<char> = spec.value().chars().collect();
+    if chars.is_empty() {
+        return Err(Error::new_spanned(spec, "list at least one character, such as \"a-z0-9_\""));
+    }
+    let mut patterns = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i + 1] == '-' {
+            let (from, to) = (chars[i], chars[i + 2]);
+            if from > to {
+                return Err(Error::new_spanned(spec, format!("`{from}-{to}` is backwards; write `{to}-{from}`")));
+            }
+            let (from, to) = (Literal::character(from), Literal::character(to));
+            patterns.push(quote!(#from..=#to));
+            i += 3;
+        } else {
+            let one = Literal::character(chars[i]);
+            patterns.push(quote!(#one));
+            i += 1;
+        }
+    }
+    Ok(patterns)
+}
+
+fn value_impl(args: TokenStream2, item: TokenStream2, is_id: bool) -> Result<TokenStream2> {
+    let attribute = if is_id { "#[oath::id]" } else { "#[oath::value]" };
+    let Rules(rules) = syn::parse2(args)?;
+    let mut item: ItemStruct = syn::parse2(item).map_err(|error| {
+        Error::new(error.span(), format!("{attribute} goes on a struct around one value, such as `struct Percent(u8);`"))
     })?;
-    reject_generics(&item.generics, "#[oath::id]")?;
-    const ID_DERIVES: [&str; 7] =
+    reject_generics(&item.generics, attribute)?;
+    const VALUE_DERIVES: [&str; 7] =
         ["Debug", "Clone", "PartialEq", "Eq", "Hash", "Serialize", "Deserialize"];
     for attr in item.attrs.iter().filter(|attr| attr.path().is_ident("derive")) {
         let paths = attr.parse_args_with(Punctuated::<Path, Token![,]>::parse_terminated)?;
         for path in paths {
             let last = path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
-            if ID_DERIVES.contains(&last.as_str()) {
+            if VALUE_DERIVES.contains(&last.as_str()) {
                 return Err(Error::new_spanned(
                     path,
-                    format!("#[oath::id] already derives {}", ID_DERIVES.join(", ")),
+                    format!("{attribute} already derives {}", VALUE_DERIVES.join(", ")),
                 ));
             }
         }
     }
-    if !matches!(&item.fields, Fields::Unnamed(fields) if fields.unnamed.len() == 1) {
-        return Err(Error::new_spanned(
-            &item.fields,
-            "an id wraps exactly one value, such as `struct OrderId(pub String);`",
-        ));
+    for field in &item.fields {
+        if !matches!(field.vis, Visibility::Inherited) {
+            return Err(Error::new_spanned(
+                &field.vis,
+                "keep the field private: build the value with `new` and read it with its getter",
+            ));
+        }
     }
-    let name = &item.ident;
+    let field = match &item.fields {
+        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
+        Fields::Named(fields) if !is_id && !fields.named.is_empty() => {
+            return composite_value(item, rules);
+        }
+        _ if is_id => {
+            return Err(Error::new_spanned(
+                &item.fields,
+                "an id wraps exactly one value, such as `struct OrderId(String);`",
+            ));
+        }
+        _ => {
+            return Err(Error::new_spanned(
+                &item.fields,
+                "a value wraps one value, such as `struct Percent(u8);`, or has named fields, \
+                 such as `struct DiscountedPrice { price: Money, discount: Money }`",
+            ));
+        }
+    };
+    let inner = field.ty.clone();
+    let name = item.ident.clone();
+    let type_name = LitStr::new(&name.to_string(), name.span());
+    let vis = std::mem::replace(&mut item.vis, Visibility::Inherited);
+    item.vis = syn::parse2(vis_one_level_down(&vis))?;
+    let module = format_ident!("__oath_{}", name);
+    // A float value is always finite: without NaN, equality is total, so Eq and Hash are sound.
+    let float = is_float(&inner);
+
+    let finite = float.then(|| quote! {
+        if !value.is_finite() {
+            return ::core::result::Result::Err(::oath::Invalid { type_name: #type_name, rule: "finite" });
+        }
+    });
+    let checks = rules.iter().map(|Rule { key, text, kind }| {
+        let fail = quote! {
+            return ::core::result::Result::Err(::oath::Invalid { type_name: #type_name, rule: #text })
+        };
+        let opt = |e: &Option<Expr>| match e {
+            Some(e) => quote!(::core::option::Option::Some(#e)),
+            None => quote!(::core::option::Option::None),
+        };
+        match kind {
+            // The bounds are constants of the inner type, so they never change: a stored value
+            // that kept its rule when it was written keeps it on every replay.
+            RuleKind::Range(lo, hi) => {
+                let (lo, hi) = (opt(lo), opt(hi));
+                quote_spanned! {key.span()=> {
+                    const LOWEST: ::core::option::Option<#inner> = #lo;
+                    const HIGHEST: ::core::option::Option<#inner> = #hi;
+                    if !::oath::__private::in_range(value, LOWEST.as_ref(), HIGHEST.as_ref()) { #fail; }
+                } }
+            }
+            RuleKind::Len(lo, hi) => {
+                let (lo, hi) = (opt(lo), opt(hi));
+                quote_spanned! {key.span()=>
+                    if !::oath::__private::len_in(::oath::__private::text(value).chars().count(), #lo, #hi) { #fail; }
+                }
+            }
+            RuleKind::Prefix(prefix) => quote_spanned! {key.span()=>
+                if !::oath::__private::text(value).starts_with(#prefix) { #fail; }
+            },
+            RuleKind::Chars(patterns) => quote_spanned! {key.span()=>
+                if !::oath::__private::text(value).chars().all(|c| matches!(c, #( #patterns )|*)) { #fail; }
+            },
+            RuleKind::Check(path) => quote_spanned! {path.span()=>
+                let check: fn(&#inner) -> bool = #path;
+                if !check(value) { #fail; }
+            },
+        }
+    });
+    let equality = if float {
+        quote! {
+            impl ::core::cmp::PartialEq for #name {
+                fn eq(&self, other: &Self) -> bool {
+                    self.0 == other.0
+                }
+            }
+            impl ::core::cmp::Eq for #name {}
+            impl ::core::hash::Hash for #name {
+                fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
+                    // -0.0 == 0.0, so both hash as 0.0.
+                    let value = if self.0 == 0.0 { 0.0 } else { self.0 };
+                    value.to_bits().hash(state);
+                }
+            }
+        }
+    } else {
+        quote!()
+    };
+    let derives = if float {
+        quote!(::core::fmt::Debug, ::core::clone::Clone)
+    } else {
+        quote!(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq, ::core::hash::Hash)
+    };
+    let serde = quote!(::oath::__private::serde);
+    let id = if is_id { quote!(impl ::oath::Id for #name {}) } else { quote!() };
     Ok(quote! {
-        #[derive(
-            ::core::fmt::Debug,
-            ::core::clone::Clone,
-            ::core::cmp::PartialEq,
-            ::core::cmp::Eq,
-            ::core::hash::Hash,
-            ::oath::__private::serde::Serialize,
-            ::oath::__private::serde::Deserialize,
-        )]
-        #[serde(crate = "::oath::__private::serde", transparent)]
-        #item
-        impl ::oath::Id for #name {}
+        #vis use #module::#name;
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        mod #module {
+            #[allow(unused_imports)]
+            use super::*;
+
+            #[derive(#derives)]
+            #item
+            #equality
+
+            #[allow(dead_code)]
+            impl #name {
+                /// The value, if it keeps every rule; otherwise the first rule it breaks.
+                pub fn new(
+                    value: impl ::core::convert::Into<#inner>,
+                ) -> ::core::result::Result<Self, ::oath::Invalid> {
+                    let value = value.into();
+                    Self::__oath_check(&value)?;
+                    ::core::result::Result::Ok(Self(value))
+                }
+
+                /// The inner value.
+                pub fn get(&self) -> &#inner {
+                    &self.0
+                }
+
+                fn __oath_check(value: &#inner) -> ::core::result::Result<(), ::oath::Invalid> {
+                    #finite
+                    #( #checks )*
+                    ::core::result::Result::Ok(())
+                }
+            }
+
+            impl #serde::Serialize for #name {
+                fn serialize<S: #serde::Serializer>(
+                    &self,
+                    serializer: S,
+                ) -> ::core::result::Result<S::Ok, S::Error> {
+                    #serde::Serialize::serialize(&self.0, serializer)
+                }
+            }
+
+            // Deserializing runs the same rules as `new`.
+            impl<'de> #serde::Deserialize<'de> for #name {
+                fn deserialize<D: #serde::Deserializer<'de>>(
+                    deserializer: D,
+                ) -> ::core::result::Result<Self, D::Error> {
+                    let value = <#inner as #serde::Deserialize<'de>>::deserialize(deserializer)?;
+                    Self::new(value).map_err(<D::Error as #serde::de::Error>::custom)
+                }
+            }
+
+            #id
+        }
     })
 }
 

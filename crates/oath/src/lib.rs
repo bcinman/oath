@@ -16,6 +16,11 @@
 //! `PartialEq`, and serde's `Serialize` and `Deserialize`, so every command, event, and
 //! rejection can go over the wire. Your crate needs no serde dependency of its own.
 //!
+//! In an aggregate's command or event enum, each value goes over the wire as its struct's
+//! fields plus a `kind` field holding its name. The name is the struct's name unless you give
+//! one: `#[oath::event(name = "OrderPlaced")]`. Stored events are read back by this name, so
+//! before renaming an event struct, pin its old name this way.
+//!
 //! `#[oath::aggregate]` defines the enum of the aggregate's commands and the enum of its
 //! events, under the names given in `command = ...` and `event = ...`. Each holds every
 //! command its states accept and every event in their transitions, as `PlaceOrder(PlaceOrder)`,
@@ -300,6 +305,73 @@ pub mod __private {
     pub use serde;
 
     use crate::{Emitted, EventOf, On};
+    use serde::{Deserialize, Serialize};
+
+    /// The stable name of a command or event struct: its wire name and `name()`.
+    pub trait Named {
+        const NAME: &'static str;
+    }
+
+    #[derive(Serialize)]
+    struct Tagged<'a, T> {
+        kind: &'static str,
+        #[serde(flatten)]
+        fields: &'a T,
+    }
+
+    /// Writes `value` as a struct tagged with `kind`, which comes first.
+    pub fn serialize_tagged<T: Serialize, S: serde::Serializer>(
+        kind: &'static str,
+        value: &T,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Tagged { kind, fields: value }.serialize(serializer)
+    }
+
+    /// Reads a tagged struct: its `kind`, and its other fields to decode with [`untagged`].
+    pub fn read_tagged<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<(String, serde_value::Value), D::Error> {
+        use serde::de::Error;
+        use serde_value::Value;
+        let Value::Map(mut fields) = Value::deserialize(deserializer)? else {
+            return Err(D::Error::custom("expected a struct tagged with `kind`"));
+        };
+        match fields.remove(&Value::String("kind".into())) {
+            Some(Value::String(kind)) => Ok((kind, Value::Map(fields))),
+            Some(_) => Err(D::Error::custom("`kind` must be a string")),
+            None => Err(D::Error::missing_field("kind")),
+        }
+    }
+
+    /// Decodes the fields [`read_tagged`] returned as `T`.
+    pub fn untagged<T: serde::de::DeserializeOwned, E: serde::de::Error>(
+        fields: serde_value::Value,
+    ) -> Result<T, E> {
+        let is_empty = matches!(&fields, serde_value::Value::Map(map) if map.is_empty());
+        match fields.deserialize_into() {
+            Ok(value) => Ok(value),
+            // A unit struct, such as `struct OrderCancelled;`, reads from no fields.
+            Err(_) if is_empty => serde_value::Value::Unit.deserialize_into().map_err(E::custom),
+            Err(error) => Err(E::custom(error)),
+        }
+    }
+
+    /// Whether two names are equal, in a const context.
+    pub const fn same_name(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
 
     /// Starts the events a state emits. Called by the `emit` method `#[oath::aggregate]`
     /// gives each state.

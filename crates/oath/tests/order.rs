@@ -9,7 +9,8 @@ use oath::{Aggregate, Command, Decision, Edge, Event, Handle, NotAllowed, Reject
 #[oath::event] pub struct OrderPlaced { pub total: u64 }
 #[oath::event] pub struct OrderPaid { pub amount: u64 }
 #[oath::event] pub struct OrderCancelled;
-#[oath::event] pub struct RefundIssued { pub amount: u64 }
+// Renamed from `OrderRefunded`; the stable name keeps stored events readable.
+#[oath::event(name = "OrderRefunded")] pub struct RefundIssued { pub amount: u64 }
 
 #[oath::rejection] pub enum OrderRejection { WrongAmount { expected: u64 }, AlreadyFinal }
 
@@ -92,7 +93,7 @@ fn a_paid_order_cancels_through_a_refund_and_replays_to_the_same_state() {
     assert_eq!(order.state(), "Cancelled");
     assert_eq!(Order::replay(&history).state(), "Cancelled");
     let names: Vec<_> = history.iter().map(Event::name).collect();
-    assert_eq!(names, ["OrderPlaced", "OrderPaid", "RefundIssued", "OrderCancelled"]);
+    assert_eq!(names, ["OrderPlaced", "OrderPaid", "OrderRefunded", "OrderCancelled"]);
 }
 
 #[test]
@@ -156,9 +157,10 @@ fn commands_events_and_rejections_go_over_the_wire_as_tagged_structs() {
     let wire = to_string(&history).unwrap();
     assert_eq!(
         wire,
-        r#"[{"kind":"OrderPlaced","total":40},{"kind":"OrderPaid","amount":40},{"kind":"RefundIssued","amount":40},{"kind":"OrderCancelled"}]"#,
+        r#"[{"kind":"OrderPlaced","total":40},{"kind":"OrderPaid","amount":40},{"kind":"OrderRefunded","amount":40},{"kind":"OrderCancelled"}]"#,
     );
     let received: Vec<OrderEvent> = from_str(&wire).unwrap();
+    assert!(from_str::<OrderEvent>(r#"{"kind":"RefundIssued","amount":40}"#).is_err());
     assert_eq!(received, history);
     assert_eq!(Order::replay(&received).state(), "Cancelled");
 
@@ -186,7 +188,7 @@ fn transitions_list_every_declared_edge_in_order() {
             edge("Placed", "OrderPaid", "Paid"),
             edge("Placed", "OrderCancelled", "Cancelled"),
             edge("Paid", "OrderCancelled", "Cancelled"),
-            edge("Paid", "RefundIssued", "Paid"),
+            edge("Paid", "OrderRefunded", "Paid"),
         ],
     );
 }

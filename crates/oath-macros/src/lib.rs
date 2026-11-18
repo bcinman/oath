@@ -96,12 +96,37 @@ fn standard_derives() -> TokenStream2 {
     }
 }
 
-fn message(args: TokenStream2, item: TokenStream2, kind: Kind) -> Result<TokenStream2> {
-    if !args.is_empty() {
-        return Err(Error::new_spanned(args, format!("{} takes no arguments", kind.attribute())));
+/// The optional `name = "..."` of `#[oath::command]` and `#[oath::event]`.
+struct NameArg(Option<LitStr>);
+
+impl Parse for NameArg {
+    fn parse(input: ParseStream) -> Result<Self> {
+        if input.is_empty() {
+            return Ok(NameArg(None));
+        }
+        let key: Ident = input.parse()?;
+        if key != "name" {
+            return Err(Error::new_spanned(key, "expected `name = \"...\"`"));
+        }
+        input.parse::<Token![=]>()?;
+        let name: LitStr = input.parse()?;
+        if name.value().is_empty() {
+            return Err(Error::new_spanned(name, "the name can't be empty"));
+        }
+        if !input.is_empty() {
+            input.parse::<Token![,]>()?;
+        }
+        if !input.is_empty() {
+            return Err(input.error("expected only `name = \"...\"`"));
+        }
+        Ok(NameArg(Some(name)))
     }
+}
+
+fn message(args: TokenStream2, item: TokenStream2, kind: Kind) -> Result<TokenStream2> {
+    let NameArg(name) = syn::parse2(args)?;
     match syn::parse2::<Item>(item)? {
-        Item::Struct(item) => message_struct(item, kind),
+        Item::Struct(item) => message_struct(item, kind, name),
         Item::Enum(item) => Err(Error::new_spanned(
             &item.ident,
             format!(
@@ -115,7 +140,7 @@ fn message(args: TokenStream2, item: TokenStream2, kind: Kind) -> Result<TokenSt
     }
 }
 
-fn message_struct(item: ItemStruct, kind: Kind) -> Result<TokenStream2> {
+fn message_struct(item: ItemStruct, kind: Kind, stable_name: Option<LitStr>) -> Result<TokenStream2> {
     reject_standard_derives(&item.attrs, kind)?;
     if matches!(item.fields, Fields::Unnamed(_)) {
         return Err(Error::new_spanned(
@@ -139,13 +164,16 @@ fn message_struct(item: ItemStruct, kind: Kind) -> Result<TokenStream2> {
         _ => TokenStream2::new(),
     };
     let name = &item.ident;
-    let name_str = LitStr::new(&name.to_string(), name.span());
+    let name_str = stable_name.unwrap_or_else(|| LitStr::new(&name.to_string(), name.span()));
     let trait_path = kind.trait_path();
     let (impl_generics, type_generics, where_clause) = item.generics.split_for_impl();
     let standard = standard_derives();
     Ok(quote! {
         #standard
         #item
+        impl #impl_generics ::oath::__private::Named for #name #type_generics #where_clause {
+            const NAME: &'static str = #name_str;
+        }
         impl #impl_generics #trait_path for #name #type_generics #where_clause {
             fn name(&self) -> &'static str { #name_str }
             #target
@@ -243,13 +271,56 @@ fn grouping_enum(
     extra: TokenStream2,
 ) -> TokenStream2 {
     let trait_path = kind.trait_path();
-    let standard = standard_derives();
     let doc = format!("The {}s of one aggregate. Defined by `#[oath::aggregate]`.", kind.noun());
+    // Each variant goes over the wire under its struct's stable name, which only the struct's
+    // `Named` impl knows, so the serde impls are written out rather than derived.
+    let pairs = names.iter().enumerate().flat_map(|(i, a)| names[i + 1..].iter().map(move |b| (a, b)));
+    let distinct = pairs.map(|(a, b)| {
+        let message = format!("`{a}` and `{b}` have the same name in {name}; give one `name = \"...\"`");
+        quote! {
+            const _: () = ::core::assert!(
+                !::oath::__private::same_name(
+                    <#a as ::oath::__private::Named>::NAME,
+                    <#b as ::oath::__private::Named>::NAME,
+                ),
+                #message,
+            );
+        }
+    });
+    let serde = quote!(::oath::__private::serde);
     quote! {
         #[doc = #doc]
-        #standard
-        #[serde(tag = #TAG_FIELD)]
+        #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq)]
         #vis enum #name { #( #names(#names), )* }
+        #( #distinct )*
+        impl #serde::Serialize for #name {
+            fn serialize<S: #serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> ::core::result::Result<S::Ok, S::Error> {
+                match self {
+                    #( Self::#names(inner) => ::oath::__private::serialize_tagged(
+                        <#names as ::oath::__private::Named>::NAME, inner, serializer,
+                    ), )*
+                }
+            }
+        }
+        impl<'de> #serde::Deserialize<'de> for #name {
+            fn deserialize<D: #serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> ::core::result::Result<Self, D::Error> {
+                let (kind, fields) = ::oath::__private::read_tagged(deserializer)?;
+                #(
+                    if kind == <#names as ::oath::__private::Named>::NAME {
+                        return ::oath::__private::untagged(fields).map(Self::#names);
+                    }
+                )*
+                ::core::result::Result::Err(<D::Error as #serde::de::Error>::unknown_variant(
+                    &kind,
+                    &[ #( <#names as ::oath::__private::Named>::NAME ),* ],
+                ))
+            }
+        }
         impl #trait_path for #name {
             fn name(&self) -> &'static str {
                 match self { #( Self::#names(inner) => <#names as #trait_path>::name(inner), )* }
@@ -649,8 +720,10 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
                 (#inner::#state(state), #event::#on(event)) =>
                     Self(#inner::#to(<#state as ::oath::Transition<#on>>::evolve(state, event))),
             });
-            let (from, on, to) = (lit(state), lit(on), lit(to));
-            edges.push(quote! { ::oath::Edge { from: #from, event: #on, to: #to } });
+            let (from, to) = (lit(state), lit(to));
+            edges.push(quote! {
+                ::oath::Edge { from: #from, event: <#on as ::oath::__private::Named>::NAME, to: #to }
+            });
         }
     }
 

@@ -14,7 +14,7 @@ use oath::{Aggregate, Command, Decision, Edge, Event, Handle, NotAllowed, Reject
 
 #[oath::rejection] pub enum OrderRejection { WrongAmount { expected: u64 }, AlreadyFinal }
 
-#[derive(Default)] pub struct Draft;
+pub struct Draft;
 pub struct Placed { total: u64 }
 pub struct Paid { amount: u64 }
 pub struct Cancelled;

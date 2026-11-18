@@ -1060,6 +1060,18 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     let event_enum = grouping_enum(&item.vis, &event, &events, Kind::Event, TokenStream2::new());
     // Each command and event belongs to this aggregate alone. A second aggregate that lists
     // the same struct implements the trait again, which doesn't compile.
+    // The initial state means no event has happened yet, so it holds no data: any data it
+    // had would come from no event. It is built as `Initial {}`, which has no fields to fill.
+    let initial_value = quote_spanned! {initial.span()=> #initial {} };
+    let empty_initial = {
+        let message = format!(
+            "the initial state `{initial}` must hold no data, since no event has happened yet; \
+             write `struct {initial};` and let the first event bring the data into the next state"
+        );
+        quote_spanned! {initial.span()=>
+            const _: () = ::core::assert!(::core::mem::size_of::<#initial>() == 0, #message);
+        }
+    };
     let aggregate_name = item.ident.clone();
     let owned = commands.iter().chain(&events).map(|owned| {
         quote_spanned! {owned.span()=>
@@ -1142,6 +1154,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 
         #vis use #module::#name;
         #owned
+        #empty_initial
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -1157,7 +1170,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 
             impl ::core::default::Default for #name {
                 fn default() -> Self {
-                    Self(#inner::#initial(<#initial as ::core::default::Default>::default()))
+                    Self(#inner::#initial(#initial_value))
                 }
             }
 

@@ -44,7 +44,8 @@
 //! [`Transition`] for every event that moves it to another state (the evolve step). The
 //! `#[state(...)]` attribute on each state is the transition table, and `#[oath::aggregate]`
 //! turns it into an [`Aggregate`] implementation. A command a state does not accept is
-//! rejected with [`NotAllowed`]. The `#[initial]` state's struct must implement `Default`.
+//! rejected with [`NotAllowed`]. The `#[initial]` state means no event has happened yet, so
+//! it holds no data: write it as `struct Draft;`.
 //!
 //! The aggregate itself is opaque: `#[oath::aggregate]` turns the enum into a struct whose
 //! state no code can build or change except [`Aggregate::evolve`], starting from the
@@ -64,7 +65,7 @@
 //!
 //! #[oath::rejection] pub enum OrderRejection { WrongAmount { expected: u64 } }
 //!
-//! #[derive(Default)] pub struct Draft;
+//! pub struct Draft;
 //! pub struct Placed { total: u64 }
 //! pub struct Paid;
 //!
@@ -158,7 +159,8 @@ pub trait Id:
 
 /// A consistency boundary: a state machine that decides which commands are accepted.
 ///
-/// Implemented only by `#[oath::aggregate]`. Its `Default` is the `#[initial]` state.
+/// Implemented only by `#[oath::aggregate]`. Its `Default` is the `#[initial]` state, which
+/// holds no data.
 pub trait Aggregate: Default + __private::Sealed {
     /// What identifies one instance of this aggregate.
     type Id: Id;

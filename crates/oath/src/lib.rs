@@ -1,6 +1,9 @@
 //! Commands, events, and aggregates: the core of a domain-driven, event-sourced system.
 //!
-//! - A **command** requests a business action. Declare it as a struct with `#[oath::command]`.
+//! - An **id** identifies one aggregate. Declare it as a branded newtype with `#[oath::id]`,
+//!   such as `struct OrderId(pub String)`.
+//! - A **command** requests a business action. Declare it as a struct with `#[oath::command]`,
+//!   and mark the field holding the id of the aggregate it targets `#[id]`.
 //! - An **event** records something that happened. Declare it as a struct with `#[oath::event]`.
 //! - An **aggregate** decides which commands are accepted and how events change its state.
 //!   Every aggregate is a state machine: an enum of state names with `#[oath::aggregate]`.
@@ -26,10 +29,12 @@
 //! rejected with [`NotAllowed`]. The `#[initial]` state's struct must implement `Default`.
 //!
 //! ```
-//! use oath::{Aggregate, Handle, NotAllowed, Transition};
+//! use oath::{Aggregate, Command, Handle, NotAllowed, Transition};
 //!
-//! #[oath::command] pub struct PlaceOrder { pub total: u64 }
-//! #[oath::command] pub struct PayOrder;
+//! #[oath::id] pub struct OrderId(pub String);
+//!
+//! #[oath::command] pub struct PlaceOrder { #[id] pub order: OrderId, pub total: u64 }
+//! #[oath::command] pub struct PayOrder { #[id] pub order: OrderId }
 //!
 //! #[oath::event] pub struct OrderPlaced { pub total: u64 }
 //! #[oath::event] pub struct OrderPaid { pub amount: u64 }
@@ -40,7 +45,7 @@
 //! pub struct Placed { total: u64 }
 //! pub struct Paid;
 //!
-//! #[oath::aggregate(command = OrderCommand, event = OrderEvent, rejection = OrderRejection)]
+//! #[oath::aggregate(id = OrderId, command = OrderCommand, event = OrderEvent, rejection = OrderRejection)]
 //! pub enum Order {
 //!     #[initial]
 //!     #[state(accepts(PlaceOrder), on(OrderPlaced => Placed))]
@@ -69,31 +74,40 @@
 //!     fn evolve(self, _: &OrderPaid) -> Paid { Paid }
 //! }
 //!
-//! let events = Order::default().decide(&PlaceOrder { total: 40 }.into()).unwrap();
+//! let id = || OrderId("o-1".into());
+//! let place: OrderCommand = PlaceOrder { order: id(), total: 40 }.into();
+//! assert_eq!(place.target(), &id());
+//! let events = Order::default().decide(&place).unwrap();
 //! let order = Order::replay(&events);
 //! assert_eq!(order.state(), "Placed");
 //! assert_eq!(
-//!     order.decide(&PlaceOrder { total: 1 }.into()),
+//!     order.decide(&place),
 //!     Err(OrderRejection::NotAllowed(NotAllowed { state: "Placed".into(), command: "PlaceOrder".into() })),
 //! );
-//! assert_eq!(order.decide(&PayOrder.into()), Ok(vec![OrderPaid { amount: 40 }.into()]));
+//! let pay = PayOrder { order: id() }.into();
+//! assert_eq!(order.decide(&pay), Ok(vec![OrderPaid { amount: 40 }.into()]));
 //! ```
 
-pub use oath_macros::{aggregate, command, event, rejection};
+pub use oath_macros::{aggregate, command, event, id, rejection};
 
 /// A request to perform one business action, named in the imperative.
 ///
-/// Implemented by `#[oath::command]` on each command struct and on the enum that groups one
-/// aggregate's commands.
+/// Implemented by `#[oath::command]` on each command struct, and by `#[oath::aggregate]` on
+/// the enum of one aggregate's commands. A command targets exactly one aggregate: the field
+/// marked `#[id]` holds that aggregate's id.
 pub trait Command {
+    /// The id type of the aggregate this command targets.
+    type Id: Id;
     /// The command's stable name: the struct's name, or for an enum, its variant's.
     fn name(&self) -> &'static str;
+    /// The id of the aggregate this command targets: the field marked `#[id]`.
+    fn target(&self) -> &Self::Id;
 }
 
 /// A fact that happened, named in the past tense.
 ///
-/// Implemented by `#[oath::event]` on each event struct and on the enum that groups one
-/// aggregate's events.
+/// Implemented by `#[oath::event]` on each event struct, and by `#[oath::aggregate]` on the
+/// enum of one aggregate's events. Events carry no id: they belong to their aggregate's history.
 pub trait Event {
     /// The event's stable name: the struct's name, or for an enum, its variant's.
     fn name(&self) -> &'static str;
@@ -109,12 +123,24 @@ pub trait Rejection: From<NotAllowed> {
     fn name(&self) -> &'static str;
 }
 
+/// An aggregate's identity: a branded newtype around one value, so an `OrderId` is never
+/// mistaken for a `CustomerId` or a plain string.
+///
+/// Implemented by `#[oath::id]`, which derives `Debug`, `Clone`, `PartialEq`, `Eq`, `Hash`, and
+/// serde. On the wire an id is its inner value: `OrderId("o-1".into())` is `"o-1"`.
+pub trait Id:
+    Clone + Eq + core::hash::Hash + core::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned
+{
+}
+
 /// A consistency boundary: a state machine that decides which commands are accepted.
 ///
 /// Implemented only by `#[oath::aggregate]`. Its `Default` is the `#[initial]` state.
 pub trait Aggregate: Default + __private::Sealed {
-    /// The enum of commands this aggregate decides.
-    type Command: Command;
+    /// What identifies one instance of this aggregate.
+    type Id: Id;
+    /// The enum of commands this aggregate decides. Each one targets an aggregate by its id.
+    type Command: Command<Id = Self::Id>;
     /// The enum of events this aggregate records.
     type Event: Event;
     /// The enum of reasons this aggregate rejects a command for.

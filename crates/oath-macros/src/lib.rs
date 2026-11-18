@@ -1,9 +1,9 @@
 //! Attribute macros for the `oath` crate. Use them through `oath`: `#[oath::command]`,
-//! `#[oath::event]`, `#[oath::rejection]`, and `#[oath::aggregate(...)]`.
+//! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, and `#[oath::aggregate(...)]`.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
@@ -21,6 +21,13 @@ pub fn command(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn event(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(message(args.into(), item.into(), Kind::Event))
+}
+
+/// Declares an aggregate's identity: a branded newtype around one value, such as
+/// `struct OrderId(pub String)`.
+#[proc_macro_attribute]
+pub fn id(args: TokenStream, item: TokenStream) -> TokenStream {
+    expand(id_impl(args.into(), item.into()))
 }
 
 /// Declares the enum of one aggregate's rejection reasons, and adds a `NotAllowed` variant.
@@ -120,6 +127,17 @@ fn message_struct(item: ItemStruct, kind: Kind) -> Result<TokenStream2> {
         ));
     }
     reject_tag_field(&item.fields)?;
+    let mut item = item;
+    let target = match kind {
+        Kind::Command => {
+            let (field, ty) = take_target_field(&mut item)?;
+            quote! {
+                type Id = #ty;
+                fn target(&self) -> &#ty { &self.#field }
+            }
+        }
+        _ => TokenStream2::new(),
+    };
     let name = &item.ident;
     let name_str = LitStr::new(&name.to_string(), name.span());
     let trait_path = kind.trait_path();
@@ -130,12 +148,100 @@ fn message_struct(item: ItemStruct, kind: Kind) -> Result<TokenStream2> {
         #item
         impl #impl_generics #trait_path for #name #type_generics #where_clause {
             fn name(&self) -> &'static str { #name_str }
+            #target
         }
     })
 }
 
+/// Removes `#[id]` from the one field that names the command's target aggregate, and returns
+/// that field and its type.
+fn take_target_field(item: &mut ItemStruct) -> Result<(Ident, Type)> {
+    let mut target: Option<(Ident, Type)> = None;
+    for field in item.fields.iter_mut() {
+        let before = field.attrs.len();
+        field.attrs.retain(|attr| !attr.path().is_ident("id"));
+        if field.attrs.len() == before {
+            continue;
+        }
+        if before - field.attrs.len() > 1 {
+            return Err(Error::new_spanned(&*field, "mark the field #[id] once"));
+        }
+        if let Some((first, _)) = &target {
+            return Err(Error::new_spanned(
+                &*field,
+                format!("a command targets one aggregate; `{first}` is already its #[id]"),
+            ));
+        }
+        let ident = field.ident.clone().expect("tuple fields were rejected");
+        target = Some((ident, field.ty.clone()));
+    }
+    target.ok_or_else(|| {
+        Error::new_spanned(
+            &item.ident,
+            "a command targets one aggregate; mark the field holding its id #[id], \
+             such as `#[id] pub order: OrderId`",
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// #[oath::id]
+
+fn id_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
+    if !args.is_empty() {
+        return Err(Error::new_spanned(args, "#[oath::id] takes no arguments"));
+    }
+    let item: ItemStruct = syn::parse2(item).map_err(|error| {
+        Error::new(error.span(), "#[oath::id] goes on a struct around one value, such as `struct OrderId(pub String);`")
+    })?;
+    reject_generics(&item.generics, "#[oath::id]")?;
+    const ID_DERIVES: [&str; 7] =
+        ["Debug", "Clone", "PartialEq", "Eq", "Hash", "Serialize", "Deserialize"];
+    for attr in item.attrs.iter().filter(|attr| attr.path().is_ident("derive")) {
+        let paths = attr.parse_args_with(Punctuated::<Path, Token![,]>::parse_terminated)?;
+        for path in paths {
+            let last = path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+            if ID_DERIVES.contains(&last.as_str()) {
+                return Err(Error::new_spanned(
+                    path,
+                    format!("#[oath::id] already derives {}", ID_DERIVES.join(", ")),
+                ));
+            }
+        }
+    }
+    if !matches!(&item.fields, Fields::Unnamed(fields) if fields.unnamed.len() == 1) {
+        return Err(Error::new_spanned(
+            &item.fields,
+            "an id wraps exactly one value, such as `struct OrderId(pub String);`",
+        ));
+    }
+    let name = &item.ident;
+    Ok(quote! {
+        #[derive(
+            ::core::fmt::Debug,
+            ::core::clone::Clone,
+            ::core::cmp::PartialEq,
+            ::core::cmp::Eq,
+            ::core::hash::Hash,
+            ::oath::__private::serde::Serialize,
+            ::oath::__private::serde::Deserialize,
+        )]
+        #[serde(crate = "::oath::__private::serde", transparent)]
+        #item
+        impl ::oath::Id for #name {}
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+
 /// The enum of one aggregate's commands or events: `Name(Name)` for each struct in `names`.
-fn grouping_enum(vis: &Visibility, name: &Ident, names: &[Ident], kind: Kind) -> TokenStream2 {
+fn grouping_enum(
+    vis: &Visibility,
+    name: &Ident,
+    names: &[Ident],
+    kind: Kind,
+    extra: TokenStream2,
+) -> TokenStream2 {
     let trait_path = kind.trait_path();
     let standard = standard_derives();
     let doc = format!("The {}s of one aggregate. Defined by `#[oath::aggregate]`.", kind.noun());
@@ -148,6 +254,7 @@ fn grouping_enum(vis: &Visibility, name: &Ident, names: &[Ident], kind: Kind) ->
             fn name(&self) -> &'static str {
                 match self { #( Self::#names(inner) => <#names as #trait_path>::name(inner), )* }
             }
+            #extra
         }
         #(
             impl ::core::convert::From<#names> for #name {
@@ -274,6 +381,7 @@ fn rejection_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 // #[oath::aggregate]
 
 struct AggregateArgs {
+    id: Type,
     command: Ident,
     event: Ident,
     rejection: Type,
@@ -281,21 +389,22 @@ struct AggregateArgs {
 
 impl Parse for AggregateArgs {
     fn parse(input: ParseStream) -> Result<Self> {
-        let (mut command, mut event, mut rejection) = (None, None, None);
+        let (mut id, mut command, mut event, mut rejection) = (None, None, None, None);
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
+                "id" if id.is_none() => id = Some(input.parse()?),
                 "command" if command.is_none() => command = Some(enum_name(input)?),
                 "event" if event.is_none() => event = Some(enum_name(input)?),
                 "rejection" if rejection.is_none() => rejection = Some(input.parse()?),
-                "command" | "event" | "rejection" => {
+                "id" | "command" | "event" | "rejection" => {
                     return Err(Error::new_spanned(key, "given twice"));
                 }
                 _ => {
                     return Err(Error::new_spanned(
                         key,
-                        "expected `command = ...`, `event = ...`, or `rejection = ...`",
+                        "expected `id = ...`, `command = ...`, `event = ...`, or `rejection = ...`",
                     ));
                 }
             }
@@ -307,10 +416,11 @@ impl Parse for AggregateArgs {
             Error::new(
                 Span::call_site(),
                 format!("#[oath::aggregate] needs `{what} = ...`; expected \
-                         #[oath::aggregate(command = ..., event = ..., rejection = ...)]"),
+                         #[oath::aggregate(id = ..., command = ..., event = ..., rejection = ...)]"),
             )
         };
         Ok(AggregateArgs {
+            id: id.ok_or_else(|| missing("id"))?,
             command: command.ok_or_else(|| missing("command"))?,
             event: event.ok_or_else(|| missing("event"))?,
             rejection: rejection.ok_or_else(|| missing("rejection"))?,
@@ -382,7 +492,7 @@ impl Parse for StateSpec {
 }
 
 fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
-    let AggregateArgs { command, event, rejection } = syn::parse2(args)?;
+    let AggregateArgs { id, command, event, rejection } = syn::parse2(args)?;
     let mut item: ItemEnum = syn::parse2(item).map_err(|error| {
         Error::new(error.span(), "#[oath::aggregate] goes on an enum of state names")
     })?;
@@ -447,8 +557,24 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     if events.is_empty() {
         return Err(Error::new_spanned(&item.ident, "no state has a transition; list one in #[state(on(Event => State))]"));
     }
-    let command_enum = grouping_enum(&item.vis, &command, &commands, Kind::Command);
-    let event_enum = grouping_enum(&item.vis, &event, &events, Kind::Event);
+    // Each arm carries its command's span, so a command whose #[id] has another aggregate's
+    // id type is reported at that command in `accepts(...)`.
+    let target_arms = commands.iter().map(|command| {
+        quote_spanned! {command.span()=>
+            Self::#command(inner) => {
+                let target: &#id = ::oath::Command::target(inner);
+                target
+            }
+        }
+    });
+    let target = quote! {
+        type Id = #id;
+        fn target(&self) -> &#id {
+            match self { #( #target_arms )* }
+        }
+    };
+    let command_enum = grouping_enum(&item.vis, &command, &commands, Kind::Command, target);
+    let event_enum = grouping_enum(&item.vis, &event, &events, Kind::Event, TokenStream2::new());
 
     let name = &item.ident;
     let lit = |ident: &Ident| LitStr::new(&ident.to_string(), ident.span());
@@ -490,6 +616,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
         #( impl ::oath::State for #states { type Aggregate = #name; } )*
 
         impl ::oath::Aggregate for #name {
+            type Id = #id;
             type Command = #command;
             type Event = #event;
             type Rejection = #rejection;

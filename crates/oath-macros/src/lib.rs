@@ -8,16 +8,16 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
     Attribute, Error, Fields, Ident, Item, ItemEnum, ItemStruct, LitStr, Path, Result, Token, Type,
-    parenthesized, parse_quote,
+    Visibility, parenthesized, parse_quote,
 };
 
-/// Declares a command struct, or the enum of one aggregate's commands.
+/// Declares a command struct. `#[oath::aggregate]` defines the enum of an aggregate's commands.
 #[proc_macro_attribute]
 pub fn command(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(message(args.into(), item.into(), Kind::Command))
 }
 
-/// Declares an event struct, or the enum of one aggregate's events.
+/// Declares an event struct. `#[oath::aggregate]` defines the enum of an aggregate's events.
 #[proc_macro_attribute]
 pub fn event(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(message(args.into(), item.into(), Kind::Event))
@@ -95,11 +95,16 @@ fn message(args: TokenStream2, item: TokenStream2, kind: Kind) -> Result<TokenSt
     }
     match syn::parse2::<Item>(item)? {
         Item::Struct(item) => message_struct(item, kind),
-        Item::Enum(item) => message_enum(item, kind),
-        other => Err(Error::new_spanned(
-            other,
-            format!("{} goes on a struct or on an enum of {} names", kind.attribute(), kind.noun()),
+        Item::Enum(item) => Err(Error::new_spanned(
+            &item.ident,
+            format!(
+                "{} goes on a struct; #[oath::aggregate] defines the enum of an aggregate's {}s \
+                 from its #[state(...)] attributes",
+                kind.attribute(),
+                kind.noun()
+            ),
         )),
+        other => Err(Error::new_spanned(other, format!("{} goes on a struct", kind.attribute()))),
     }
 }
 
@@ -129,17 +134,16 @@ fn message_struct(item: ItemStruct, kind: Kind) -> Result<TokenStream2> {
     })
 }
 
-fn message_enum(mut item: ItemEnum, kind: Kind) -> Result<TokenStream2> {
-    reject_standard_derives(&item.attrs, kind)?;
-    reject_generics(&item.generics, kind.attribute())?;
-    let names = wrap_variants(&mut item, kind.noun())?;
-    let name = &item.ident;
+/// The enum of one aggregate's commands or events: `Name(Name)` for each struct in `names`.
+fn grouping_enum(vis: &Visibility, name: &Ident, names: &[Ident], kind: Kind) -> TokenStream2 {
     let trait_path = kind.trait_path();
     let standard = standard_derives();
-    Ok(quote! {
+    let doc = format!("The {}s of one aggregate. Defined by `#[oath::aggregate]`.", kind.noun());
+    quote! {
+        #[doc = #doc]
         #standard
         #[serde(tag = #TAG_FIELD)]
-        #item
+        #vis enum #name { #( #names(#names), )* }
         impl #trait_path for #name {
             fn name(&self) -> &'static str {
                 match self { #( Self::#names(inner) => <#names as #trait_path>::name(inner), )* }
@@ -150,7 +154,7 @@ fn message_enum(mut item: ItemEnum, kind: Kind) -> Result<TokenStream2> {
                 fn from(inner: #names) -> Self { Self::#names(inner) }
             }
         )*
-    })
+    }
 }
 
 /// Turns each bare variant `Name` into `Name(Name)` and returns the names.
@@ -270,8 +274,8 @@ fn rejection_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 // #[oath::aggregate]
 
 struct AggregateArgs {
-    command: Path,
-    event: Path,
+    command: Ident,
+    event: Ident,
     rejection: Type,
 }
 
@@ -282,8 +286,8 @@ impl Parse for AggregateArgs {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
-                "command" if command.is_none() => command = Some(input.parse()?),
-                "event" if event.is_none() => event = Some(input.parse()?),
+                "command" if command.is_none() => command = Some(enum_name(input)?),
+                "event" if event.is_none() => event = Some(enum_name(input)?),
                 "rejection" if rejection.is_none() => rejection = Some(input.parse()?),
                 "command" | "event" | "rejection" => {
                     return Err(Error::new_spanned(key, "given twice"));
@@ -312,6 +316,14 @@ impl Parse for AggregateArgs {
             rejection: rejection.ok_or_else(|| missing("rejection"))?,
         })
     }
+}
+
+/// The name of an enum `#[oath::aggregate]` defines: a plain name, not a path.
+fn enum_name(input: ParseStream) -> Result<Ident> {
+    let path: Path = input.parse()?;
+    path.get_ident().cloned().ok_or_else(|| {
+        Error::new_spanned(path, "name the enum to define here, such as `OrderCommand`, not a path")
+    })
 }
 
 #[derive(Default)]
@@ -415,6 +427,29 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
         }
     }
 
+    // Each command and event appears once, in the order the states first list it.
+    let (mut commands, mut events) = (Vec::<Ident>::new(), Vec::<Ident>::new());
+    for spec in &specs {
+        for accepted in &spec.accepts {
+            if !commands.contains(accepted) {
+                commands.push(accepted.clone());
+            }
+        }
+        for (on, _) in &spec.on {
+            if !events.contains(on) {
+                events.push(on.clone());
+            }
+        }
+    }
+    if commands.is_empty() {
+        return Err(Error::new_spanned(&item.ident, "no state accepts a command; list one in #[state(accepts(...))]"));
+    }
+    if events.is_empty() {
+        return Err(Error::new_spanned(&item.ident, "no state has a transition; list one in #[state(on(Event => State))]"));
+    }
+    let command_enum = grouping_enum(&item.vis, &command, &commands, Kind::Command);
+    let event_enum = grouping_enum(&item.vis, &event, &events, Kind::Event);
+
     let name = &item.ident;
     let lit = |ident: &Ident| LitStr::new(&ident.to_string(), ident.span());
     let state_strs: Vec<_> = states.iter().map(lit).collect();
@@ -441,6 +476,8 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 
     Ok(quote! {
         #item
+        #command_enum
+        #event_enum
 
         impl ::oath::__private::Sealed for #name {}
 

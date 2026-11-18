@@ -13,10 +13,11 @@
 //! `PartialEq`, and serde's `Serialize` and `Deserialize`, so every command, event, and
 //! rejection can go over the wire. Your crate needs no serde dependency of its own.
 //!
-//! Each aggregate groups its commands in one enum and its events in another. Write each enum
-//! as a list of struct names, such as `enum OrderCommand { PlaceOrder, PayOrder }`, with the
-//! same attribute; it expands each name to `PlaceOrder(PlaceOrder)` and adds `From` for each
-//! struct. The aggregate's states are listed the same way.
+//! `#[oath::aggregate]` defines the enum of the aggregate's commands and the enum of its
+//! events, under the names given in `command = ...` and `event = ...`. Each holds every
+//! command its states accept and every event in their transitions, as `PlaceOrder(PlaceOrder)`,
+//! and has `From` for each struct. The aggregate's states are listed as bare names, and each
+//! name expands the same way.
 //!
 //! Each state implements [`Handle`] for every command it accepts (the decide step) and
 //! [`Transition`] for every event that moves it to another state (the evolve step). The
@@ -29,11 +30,9 @@
 //!
 //! #[oath::command] pub struct PlaceOrder { pub total: u64 }
 //! #[oath::command] pub struct PayOrder;
-//! #[oath::command] pub enum OrderCommand { PlaceOrder, PayOrder }
 //!
 //! #[oath::event] pub struct OrderPlaced { pub total: u64 }
 //! #[oath::event] pub struct OrderPaid { pub amount: u64 }
-//! #[oath::event] pub enum OrderEvent { OrderPlaced, OrderPaid }
 //!
 //! #[oath::rejection] pub enum OrderRejection { WrongAmount { expected: u64 } }
 //!

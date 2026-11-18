@@ -3,13 +3,11 @@ use oath::{Aggregate, Command, Edge, Event, Handle, NotAllowed, Rejection, Trans
 #[oath::command] pub struct PlaceOrder { pub total: u64 }
 #[oath::command] pub struct PayOrder { pub amount: u64 }
 #[oath::command] pub struct CancelOrder;
-#[oath::command] pub enum OrderCommand { PlaceOrder, PayOrder, CancelOrder }
 
 #[oath::event] pub struct OrderPlaced { pub total: u64 }
 #[oath::event] pub struct OrderPaid { pub amount: u64 }
 #[oath::event] pub struct OrderCancelled;
 #[oath::event] pub struct RefundIssued { pub amount: u64 }
-#[oath::event] pub enum OrderEvent { OrderPlaced, OrderPaid, OrderCancelled, RefundIssued }
 
 #[oath::rejection] pub enum OrderRejection { WrongAmount { expected: u64 }, AlreadyFinal }
 

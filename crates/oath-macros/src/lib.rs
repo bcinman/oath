@@ -677,6 +677,8 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     item.ident = inner.clone();
     let struct_attrs = std::mem::take(&mut item.attrs);
     item.attrs = struct_attrs.iter().filter(|attr| !attr.path().is_ident("doc")).cloned().collect();
+    // A final state's data is read by no generated code, only by the user's own impls.
+    item.attrs.push(parse_quote!(#[allow(dead_code)]));
     let lit = |ident: &Ident| LitStr::new(&ident.to_string(), ident.span());
     let state_strs: Vec<_> = states.iter().map(lit).collect();
 

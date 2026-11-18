@@ -28,6 +28,11 @@
 //! turns it into an [`Aggregate`] implementation. A command a state does not accept is
 //! rejected with [`NotAllowed`]. The `#[initial]` state's struct must implement `Default`.
 //!
+//! The aggregate itself is opaque: `#[oath::aggregate]` turns the enum into a struct whose
+//! state no code can build or change except [`Aggregate::evolve`], starting from the
+//! `#[initial]` state. Read the current state's name with [`Aggregate::state`]. Declare
+//! aggregates at module level, not inside a function body.
+//!
 //! ```
 //! use oath::{Aggregate, Command, Decision, Handle, NotAllowed, Transition};
 //!
@@ -72,6 +77,7 @@
 //!     fn evolve(self, _: &OrderPaid) -> Paid { Paid }
 //! }
 //!
+//! # fn main() {
 //! let id = || OrderId("o-1".into());
 //! let place: OrderCommand = PlaceOrder { order: id(), total: 40 }.into();
 //! assert_eq!(place.target(), &id());
@@ -84,6 +90,7 @@
 //! );
 //! let pay = PayOrder { order: id() }.into();
 //! assert_eq!(order.decide(&pay), Ok(vec![OrderPaid { amount: 40 }.into()]));
+//! # }
 //! ```
 
 pub use oath_macros::{aggregate, command, event, id, rejection};

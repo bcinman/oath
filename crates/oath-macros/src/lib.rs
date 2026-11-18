@@ -3,7 +3,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{quote, quote_spanned};
+use quote::{format_ident, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
@@ -428,6 +428,25 @@ impl Parse for AggregateArgs {
     }
 }
 
+/// The same visibility as `vis`, written for an item one module further down.
+fn vis_one_level_down(vis: &Visibility) -> TokenStream2 {
+    match vis {
+        Visibility::Inherited => quote!(pub(super)),
+        Visibility::Restricted(restricted) => {
+            let path = &restricted.path;
+            match path.segments.first().map(|segment| segment.ident.to_string()).as_deref() {
+                Some("crate") => quote!(#vis),
+                Some("self") => {
+                    let rest = path.segments.iter().skip(1);
+                    quote!(pub(in super #( :: #rest )*))
+                }
+                _ => quote!(pub(in super :: #path)),
+            }
+        }
+        Visibility::Public(_) => quote!(#vis),
+    }
+}
+
 /// The name of an enum `#[oath::aggregate]` defines: a plain name, not a path.
 fn enum_name(input: ParseStream) -> Result<Ident> {
     let path: Path = input.parse()?;
@@ -576,7 +595,17 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     let command_enum = grouping_enum(&item.vis, &command, &commands, Kind::Command, target);
     let event_enum = grouping_enum(&item.vis, &event, &events, Kind::Event, TokenStream2::new());
 
-    let name = &item.ident;
+    // The aggregate is a struct with a private field holding the state enum, both defined in a
+    // private module, so no code outside the generated impls can build a state without history.
+    let name = item.ident.clone();
+    let vis = std::mem::replace(&mut item.vis, Visibility::Inherited);
+    let inner_vis = vis_one_level_down(&vis);
+    let inner = format_ident!("__{}State", name);
+    let module = format_ident!("__oath_{}", name);
+    let (id_alias, rejection_alias) = (format_ident!("__{}Id", name), format_ident!("__{}Rejection", name));
+    item.ident = inner.clone();
+    let struct_attrs = std::mem::take(&mut item.attrs);
+    item.attrs = struct_attrs.iter().filter(|attr| !attr.path().is_ident("doc")).cloned().collect();
     let lit = |ident: &Ident| LitStr::new(&ident.to_string(), ident.span());
     let state_strs: Vec<_> = states.iter().map(lit).collect();
 
@@ -589,7 +618,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     for (state, spec) in states.iter().zip(&specs) {
         for accepted in &spec.accepts {
             decide_arms.push(quote! {
-                (Self::#state(state), #command::#accepted(command)) =>
+                (#inner::#state(state), #command::#accepted(command)) =>
                     <#state as ::oath::Handle<#accepted>>::decide(state, command)
                         .map(::oath::Events::into_vec),
             });
@@ -617,8 +646,8 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
         for (on, to) in &spec.on {
             markers.push(quote! { impl ::oath::On<#on> for #state { type To = #to; } });
             evolve_arms.push(quote! {
-                (Self::#state(state), #event::#on(event)) =>
-                    Self::#to(<#state as ::oath::Transition<#on>>::evolve(state, event)),
+                (#inner::#state(state), #event::#on(event)) =>
+                    Self(#inner::#to(<#state as ::oath::Transition<#on>>::evolve(state, event))),
             });
             let (from, on, to) = (lit(state), lit(on), lit(to));
             edges.push(quote! { ::oath::Edge { from: #from, event: #on, to: #to } });
@@ -626,60 +655,79 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     }
 
     Ok(quote! {
-        #item
         #command_enum
         #event_enum
 
-        impl ::oath::__private::Sealed for #name {}
+        #[allow(non_camel_case_types)]
+        type #id_alias = #id;
+        #[allow(non_camel_case_types)]
+        type #rejection_alias = #rejection;
 
-        impl ::core::default::Default for #name {
-            fn default() -> Self {
-                Self::#initial(<#initial as ::core::default::Default>::default())
+        #vis use #module::#name;
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        mod #module {
+            use super::*;
+
+            #( #struct_attrs )*
+            #inner_vis struct #name(#inner);
+
+            #item
+
+            impl ::oath::__private::Sealed for #name {}
+
+            impl ::core::default::Default for #name {
+                fn default() -> Self {
+                    Self(#inner::#initial(<#initial as ::core::default::Default>::default()))
+                }
+            }
+
+            impl ::oath::Aggregate for #name {
+                type Id = #id_alias;
+                type Command = #command;
+                type Event = #event;
+                type Rejection = #rejection_alias;
+
+                const TRANSITIONS: &'static [::oath::Edge] = &[ #( #edges, )* ];
+
+                fn state(&self) -> &'static str {
+                    match &self.0 { #( #inner::#states(_) => #state_strs, )* }
+                }
+
+                #[allow(unreachable_patterns)]
+                fn decide(
+                    &self,
+                    command: &#command,
+                ) -> ::core::result::Result<::std::vec::Vec<#event>, #rejection_alias> {
+                    match (&self.0, command) {
+                        #( #decide_arms )*
+                        (_, command) => ::core::result::Result::Err(::core::convert::From::from(
+                            ::oath::NotAllowed {
+                                state: ::std::string::String::from(::oath::Aggregate::state(self)),
+                                command: ::std::string::String::from(::oath::Command::name(command)),
+                            },
+                        )),
+                    }
+                }
+
+                #[allow(unreachable_patterns)]
+                fn evolve(self, event: &#event) -> Self {
+                    let from = ::oath::Aggregate::state(&self);
+                    match (self.0, event) {
+                        #( #evolve_arms )*
+                        (_, event) => ::core::panic!(
+                            "event {} has no transition from state {}; the history and the model disagree",
+                            ::oath::Event::name(event),
+                            from,
+                        ),
+                    }
+                }
             }
         }
 
         #( impl ::oath::State for #states { type Aggregate = #name; } )*
         #( #markers )*
 
-        impl ::oath::Aggregate for #name {
-            type Id = #id;
-            type Command = #command;
-            type Event = #event;
-            type Rejection = #rejection;
-
-            const TRANSITIONS: &'static [::oath::Edge] = &[ #( #edges, )* ];
-
-            fn state(&self) -> &'static str {
-                match self { #( Self::#states(_) => #state_strs, )* }
-            }
-
-            #[allow(unreachable_patterns)]
-            fn decide(
-                &self,
-                command: &#command,
-            ) -> ::core::result::Result<::std::vec::Vec<#event>, #rejection> {
-                match (self, command) {
-                    #( #decide_arms )*
-                    (state, command) => ::core::result::Result::Err(::core::convert::From::from(
-                        ::oath::NotAllowed {
-                            state: ::std::string::String::from(::oath::Aggregate::state(state)),
-                            command: ::std::string::String::from(::oath::Command::name(command)),
-                        },
-                    )),
-                }
-            }
-
-            #[allow(unreachable_patterns)]
-            fn evolve(self, event: &#event) -> Self {
-                match (self, event) {
-                    #( #evolve_arms )*
-                    (state, event) => ::core::panic!(
-                        "event {} has no transition from state {}; the history and the model disagree",
-                        ::oath::Event::name(event),
-                        ::oath::Aggregate::state(&state),
-                    ),
-                }
-            }
-        }
     })
 }

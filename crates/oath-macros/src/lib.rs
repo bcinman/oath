@@ -1,6 +1,7 @@
 //! Attribute macros for the `oath` crate. Use them through `oath`: `#[oath::command]`,
 //! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, `#[oath::value]`,
-//! `#[oath::state]`, `#[oath::aggregate(...)]`, `#[oath::context(...)]`, and `#[oath::view(...)]`.
+//! `#[oath::state]`, `#[oath::aggregate(...)]`, `#[oath::context(...)]`, `#[oath::view(...)]`,
+//! and `#[oath::saga(...)]`.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
@@ -62,6 +63,12 @@ pub fn state(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn context(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(context_impl(args.into(), item.into()))
+}
+
+/// Declares a saga: state by `key`, which reacts to the events listed in `on(...)` with commands.
+#[proc_macro_attribute]
+pub fn saga(args: TokenStream, item: TokenStream) -> TokenStream {
+    expand(saga_impl(args.into(), item.into()))
 }
 
 /// Declares a view: rows by `key`, which the events listed in `on(...)` keep up to date.
@@ -1275,6 +1282,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
 struct ContextArgs {
     aggregates: Vec<Ident>,
     views: Vec<Ident>,
+    sagas: Vec<Ident>,
 }
 
 /// A list of type names, such as `[Order, Customer]`; each name once.
@@ -1293,19 +1301,20 @@ fn name_list(input: ParseStream, noun: &str) -> Result<Vec<Ident>> {
 
 impl Parse for ContextArgs {
     fn parse(input: ParseStream) -> Result<Self> {
-        let (mut aggregates, mut views) = (None, None);
+        let (mut aggregates, mut views, mut sagas) = (None, None, None);
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "aggregates" if aggregates.is_none() => aggregates = Some(name_list(input, "aggregate")?),
                 "views" if views.is_none() => views = Some(name_list(input, "view")?),
-                "aggregates" | "views" => return Err(Error::new_spanned(key, "given twice")),
+                "sagas" if sagas.is_none() => sagas = Some(name_list(input, "saga")?),
+                "aggregates" | "views" | "sagas" => return Err(Error::new_spanned(key, "given twice")),
                 "command" | "event" | "rejection" => {
                     return Err(derived_name(&key, "#[oath::context]", "Shop"));
                 }
                 _ => {
-                    return Err(Error::new_spanned(key, "expected `aggregates = [...]` or `views = [...]`"));
+                    return Err(Error::new_spanned(key, "expected `aggregates = [...]`, `views = [...]`, or `sagas = [...]`"));
                 }
             }
             if !input.is_empty() {
@@ -1316,7 +1325,7 @@ impl Parse for ContextArgs {
             Error::new(
                 Span::call_site(),
                 format!("#[oath::context] needs {what}; expected \
-                         #[oath::context(aggregates = [...], views = [...])]"),
+                         #[oath::context(aggregates = [...], views = [...], sagas = [...])]"),
             )
         };
         let aggregates = aggregates.ok_or_else(|| missing("`aggregates = [...]`"))?;
@@ -1326,12 +1335,13 @@ impl Parse for ContextArgs {
         Ok(ContextArgs {
             aggregates,
             views: views.unwrap_or_default(),
+            sagas: sagas.unwrap_or_default(),
         })
     }
 }
 
 fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
-    let ContextArgs { aggregates, views } = syn::parse2(args)?;
+    let ContextArgs { aggregates, views, sagas } = syn::parse2(args)?;
     let item: ItemStruct = syn::parse2(item).map_err(|error| {
         Error::new(error.span(), "#[oath::context] goes on a unit struct, such as `pub struct Shop;`")
     })?;
@@ -1360,20 +1370,24 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
     let dyn_stores = quote!(
         #( ::oath::__private::DynStore<#aggregates> + )*
         #( ::oath::__private::DynViewStore<#views> + )*
+        #( ::oath::__private::DynSagaStore<#sagas> + )*
         ::core::marker::Send + ::core::marker::Sync
     );
-    let stores = quote!( #( ::oath::Store<#aggregates> + )* #( ::oath::ViewStore<#views> + )* );
+    let stores = quote!(
+        #( ::oath::Store<#aggregates> + )* #( ::oath::ViewStore<#views> + )* #( ::oath::SagaStore<#sagas> + )*
+    );
     let new_doc = format!(
         "A {name} that keeps the events and snapshots of its aggregates, and the rows of its views, \
-         in `store`, which implements [`Store`](::oath::Store) for each aggregate and \
-         [`ViewStore`](::oath::ViewStore) for each view."
+         in `store`, which implements [`Store`](::oath::Store) for each aggregate, \
+         [`ViewStore`](::oath::ViewStore) for each view, and [`SagaStore`](::oath::SagaStore) for \
+         each saga."
     );
     let first = &aggregates[0];
     // Each command goes to its aggregate.
     let send_arms = aggregates.iter().map(|aggregate| {
         quote! {
             #command::#aggregate(command) => {
-                ::oath::__private::send::<#aggregate, _>(&*self.store, &command)
+                ::oath::__private::send::<#aggregate, _>(&*self.store, &command, id)
                     .await
                     .map(|events| events.into_iter().map(#event::#aggregate).collect::<::std::vec::Vec<_>>())
                     .map_err(|error| ::oath::__private::rejected_as(error, #rejection::#aggregate))
@@ -1382,7 +1396,7 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
     });
     // Each view checks, at the context, that every event it subscribes to is recorded by an
     // aggregate the context lists.
-    let recorded = views.iter().map(|view| {
+    let recorded = views.iter().chain(&sagas).map(|view| {
         quote_spanned! {view.span()=>
             const _: fn() = || {
                 fn recorded_in<V: ::oath::__private::RecordedIn<#name>>() {}
@@ -1548,6 +1562,10 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                         ::core::result::Result::Ok((entries, upto))
                     })
                 }
+
+                fn head(&self) -> ::oath::__private::BoxFuture<'_, ::core::result::Result<::oath::Position, ::oath::__private::BoxError>> {
+                    ::std::boxed::Box::pin(<dyn #store_trait as ::oath::__private::DynStore<#first>>::dyn_head(&*self.store))
+                }
             }
 
             impl ::oath::__private::Sealed for #name {}
@@ -1565,14 +1583,43 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                 > + ::core::marker::Send {
                     let command: #command = command.into();
                     async move {
-                        let events = match command { #( #send_arms )* }?;
-                        // The events are recorded; a view the store fails to update catches up
-                        // the next time it is read or updated.
-                        #( let _ = ::oath::__private::catch_up::<#views, _, _>(&*self.store, &*self).await; )*
-                        ::core::result::Result::Ok(events)
+                        let context = &*self;
+                        // A saga added since the last send starts at the end of the log, so it
+                        // reacts to this command's events and none before.
+                        #( let _ = ::oath::__private::start::<#sagas, _, _>(&*context.store, context).await; )*
+                        let events = ::oath::Context::dispatch(context, command, ::core::option::Option::None).await?;
+                        // The events are recorded. A view or saga the store fails to update, or a
+                        // saga command it fails to send, is taken up by the next send.
+                        for _ in 0..::oath::ROUNDS {
+                            #( let _ = ::oath::__private::catch_up::<#views, _, _>(&*context.store, context).await; )*
+                            #( let _ = ::oath::__private::react::<#sagas, _, _>(&*context.store, context).await; )*
+                            let mut sent = 0;
+                            #( sent += ::oath::__private::deliver::<#sagas, _>(&*context.store, context).await.unwrap_or(0); )*
+                            if sent == 0 {
+                                return ::core::result::Result::Ok(events);
+                            }
+                        }
+                        ::core::result::Result::Err(::oath::SendError::Runaway)
                     }
                 }
+
+                fn dispatch<'a>(
+                    &'a self,
+                    command: #command,
+                    id: ::core::option::Option<&'a ::oath::CommandId>,
+                ) -> ::oath::__private::BoxFuture<
+                    'a,
+                    ::core::result::Result<::std::vec::Vec<#event>, ::oath::SendError<#rejection>>,
+                > {
+                    ::std::boxed::Box::pin(async move { match command { #( #send_arms )* } })
+                }
             }
+
+            #(
+                impl ::oath::SagaOf for #sagas {
+                    type Context = #name;
+                }
+            )*
 
             #(
                 impl ::oath::BelongsToContext for #aggregates {
@@ -1681,6 +1728,59 @@ fn view_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             }
         }
         #( impl ::oath::Subscribes<#events> for #name {} )*
+        impl<C> ::oath::__private::RecordedIn<C> for #name where #( #recorded )* {}
+    })
+}
+
+fn saga_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
+    if args.is_empty() {
+        return Err(Error::new(Span::call_site(), "#[oath::saga] needs `key = Type, on(Event, ...)`"));
+    }
+    let ViewArgs { key, events } = syn::parse2(args)?;
+    let item: ItemStruct = syn::parse2(item)
+        .map_err(|error| Error::new(error.span(), "#[oath::saga] goes on a struct"))?;
+    if !item.generics.params.is_empty() {
+        return Err(Error::new_spanned(&item.generics, "#[oath::saga] does not support generics"));
+    }
+    let name = &item.ident;
+    let name_str = LitStr::new(&name.to_string(), name.span());
+    let recorded = events.iter().map(|event| {
+        quote_spanned! {event.span()=> #event: ::oath::__private::EventIn<C>, }
+    });
+    Ok(quote! {
+        #[derive(::oath::__private::serde::Serialize, ::oath::__private::serde::Deserialize)]
+        #[serde(crate = "::oath::__private::serde")]
+        #item
+        impl ::oath::__private::Sealed for #name {}
+        impl ::oath::__private::Named for #name {
+            const NAME: &'static str = #name_str;
+        }
+        impl ::oath::Saga for #name {
+            type Key = #key;
+            fn key_of(
+                id: &dyn ::core::any::Any,
+                event: &dyn ::core::any::Any,
+            ) -> ::core::option::Option<#key> {
+                #(
+                    if let ::core::option::Option::Some(event) = event.downcast_ref::<#events>() {
+                        let id = id
+                            .downcast_ref::<<<#events as ::oath::BelongsToAggregate>::Aggregate as ::oath::Aggregate>::Id>()
+                            .expect("an event comes with the id of the aggregate that records it");
+                        return ::core::option::Option::Some(<Self as ::oath::React<#events>>::key(id, event));
+                    }
+                )*
+                ::core::option::Option::None
+            }
+            fn react_to(&mut self, key: &#key, event: &dyn ::core::any::Any) -> ::oath::Commands<Self> {
+                #(
+                    if let ::core::option::Option::Some(event) = event.downcast_ref::<#events>() {
+                        return <Self as ::oath::React<#events>>::react(self, key, event);
+                    }
+                )*
+                ::std::vec::Vec::new()
+            }
+        }
+        #( impl ::oath::Reacts<#events> for #name {} )*
         impl<C> ::oath::__private::RecordedIn<C> for #name where #( #recorded )* {}
     })
 }

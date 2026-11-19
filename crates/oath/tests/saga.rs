@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use oath::{
-    AppendError, Aggregate, Checkpoint, CommandId, Commands, Context, Decided, Decision, Handle, Loaded, Logged,
+    AppendError, Aggregate, Rejected, Checkpoint, CommandId, Commands, Context, Decided, Decision, Handle, Loaded, Logged,
     MemoryStore, NotAllowed, Pending, Position, Project, Projected, React, Reacted, Row, Saga, SagaStore, SendError,
     Store, Transition, Version, View, ViewStore,
 };
@@ -57,22 +57,26 @@ impl Transition<Withdrawn> for Open {
 
 #[oath::command] pub struct RequestTransfer { #[id] pub transfer: TransferId, pub from: AccountId, pub to: AccountId, pub amount: u64 }
 #[oath::command] pub struct CompleteTransfer { #[id] pub transfer: TransferId }
+#[oath::command] pub struct FailTransfer { #[id] pub transfer: TransferId }
 #[oath::event] pub struct TransferRequested { pub from: AccountId, pub to: AccountId, pub amount: u64 }
 #[oath::event] pub struct TransferCompleted;
+#[oath::event] pub struct TransferFailed;
 #[oath::rejection] pub enum TransferRejection {}
 
 #[oath::state] pub struct Start;
 #[oath::state] pub struct Requested;
 #[oath::state] pub struct Completed;
+#[oath::state] pub struct Failed;
 
 #[oath::aggregate(id = TransferId, rejection = TransferRejection)]
 pub enum Transfer {
     #[initial]
     #[state(accepts(RequestTransfer), on(TransferRequested => Requested))]
     Start,
-    #[state(accepts(CompleteTransfer), on(TransferCompleted => Completed))]
+    #[state(accepts(CompleteTransfer, FailTransfer), on(TransferCompleted => Completed, TransferFailed => Failed))]
     Requested,
     Completed,
+    Failed,
 }
 
 impl Handle<RequestTransfer> for Start {
@@ -88,6 +92,12 @@ impl Handle<CompleteTransfer> for Requested {
 }
 impl Transition<TransferCompleted> for Requested {
     fn evolve(self, _: &TransferCompleted) -> Completed { Completed }
+}
+impl Handle<FailTransfer> for Requested {
+    fn decide(&self, _: &FailTransfer) -> Decision<Self> { Ok(self.emit(TransferFailed).into()) }
+}
+impl Transition<TransferFailed> for Requested {
+    fn evolve(self, _: &TransferFailed) -> Failed { Failed }
 }
 
 #[oath::context(aggregates = [Account, Transfer], views = [Balance], sagas = [MoveMoney])]
@@ -128,6 +138,13 @@ impl React<Withdrawn> for MoveMoney {
     }
 }
 
+// A withdrawal the account refuses fails the transfer.
+impl Rejected for MoveMoney {
+    fn rejected(&mut self, transfer: &TransferId, _: &BankRejection) -> Commands<Self> {
+        vec![FailTransfer { transfer: transfer.clone() }.into()]
+    }
+}
+
 fn acc(id: &str) -> AccountId { AccountId::new(id).unwrap() }
 fn tr(id: &str) -> TransferId { TransferId::new(id).unwrap() }
 
@@ -162,6 +179,9 @@ struct Crashing {
     store: Arc<MemoryStore>,
     sagas: Arc<MemoryStore>,
     fail_delivered: Arc<AtomicUsize>,
+    /// How many times a view or a saga loaded its checkpoint.
+    view_checkpoints: Arc<AtomicUsize>,
+    saga_checkpoints: Arc<AtomicUsize>,
 }
 
 impl<A: Aggregate> Store<A> for Crashing
@@ -187,7 +207,10 @@ where
     MemoryStore: ViewStore<V>,
 {
     type Error = <MemoryStore as ViewStore<V>>::Error;
-    async fn checkpoint(&self) -> Result<Option<Checkpoint<V>>, Self::Error> { ViewStore::<V>::checkpoint(&*self.store).await }
+    async fn checkpoint(&self) -> Result<Option<Checkpoint<V>>, Self::Error> {
+        self.view_checkpoints.fetch_add(1, SeqCst);
+        ViewStore::<V>::checkpoint(&*self.store).await
+    }
     async fn row(&self, key: &V::Key) -> Result<Option<Row<V>>, Self::Error> { ViewStore::<V>::row(&*self.store, key).await }
     async fn save(&self, projected: &Projected<V>) -> Result<(), AppendError<Self::Error>> {
         ViewStore::<V>::save(&*self.store, projected).await
@@ -207,6 +230,7 @@ where
 {
     type Error = Crashed;
     async fn checkpoint(&self) -> Result<Option<Checkpoint<S>>, Crashed> {
+        self.saga_checkpoints.fetch_add(1, SeqCst);
         Ok(SagaStore::<S>::checkpoint(&*self.sagas).await.unwrap())
     }
     async fn row(&self, key: &S::Key) -> Result<Option<Row<S>>, Crashed> { Ok(SagaStore::<S>::row(&*self.sagas, key).await.unwrap()) }
@@ -235,16 +259,37 @@ fn a_saga_carries_a_transfer_to_its_end_within_one_send() {
 }
 
 #[test]
-fn a_rejected_saga_command_is_dropped_and_the_saga_waits() {
+fn a_rejected_saga_command_goes_to_the_saga_which_fails_the_transfer() {
     let store = Crashing::default();
     let mut bank = Bank::new(store.clone());
     open(&mut bank, 10);
     send(&mut bank, RequestTransfer { transfer: tr("tr_1"), from: acc("acc_a"), to: acc("acc_b"), amount: 40 }).unwrap();
 
+    // The withdrawal was refused, so no money moved and the saga failed the transfer.
     assert_eq!((balance(&bank, "acc_a"), balance(&bank, "acc_b")), (10, 0));
     assert!(block_on(SagaStore::<MoveMoney>::pending(&*store.sagas)).unwrap().is_empty());
-    // The transfer is still requested: nothing withdrew its money.
-    assert!(send(&mut bank, CompleteTransfer { transfer: tr("tr_1") }).is_ok());
+    assert_eq!(send(&mut bank, CompleteTransfer { transfer: tr("tr_1") }), not_allowed("Failed", "CompleteTransfer"));
+}
+
+#[test]
+fn a_send_skips_the_views_and_sagas_that_listen_for_none_of_its_events() {
+    let store = Crashing::default();
+    let mut bank = Bank::new(store.clone());
+    open(&mut bank, 100);
+    store.view_checkpoints.store(0, SeqCst);
+    store.saga_checkpoints.store(0, SeqCst);
+
+    // Balance listens for neither; MoveMoney listens for neither.
+    send(&mut bank, OpenAccount { account: acc("acc_c") }).unwrap();
+    assert_eq!((store.view_checkpoints.load(SeqCst), store.saga_checkpoints.load(SeqCst)), (0, 0));
+    // Balance listens for Deposited; MoveMoney doesn't.
+    send(&mut bank, Deposit { account: acc("acc_c"), amount: 5 }).unwrap();
+    assert!(store.view_checkpoints.load(SeqCst) > 0);
+    assert_eq!(store.saga_checkpoints.load(SeqCst), 0);
+
+    // A transfer still runs: the saga reads past the events it skipped.
+    send(&mut bank, RequestTransfer { transfer: tr("tr_1"), from: acc("acc_a"), to: acc("acc_c"), amount: 40 }).unwrap();
+    assert_eq!((balance(&bank, "acc_a"), balance(&bank, "acc_c")), (60, 45));
 }
 
 #[test]
@@ -320,6 +365,10 @@ pub struct Canyon;
 #[oath::saga(key = EchoId, on(Shouted))]
 #[derive(Default)]
 pub struct Repeat;
+
+impl Rejected for Repeat {
+    fn rejected(&mut self, _: &EchoId, _: &CanyonRejection) -> Commands<Self> { vec![] }
+}
 
 impl React<Shouted> for Repeat {
     fn key(echo: &EchoId, _: &Shouted) -> EchoId { echo.clone() }

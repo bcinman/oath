@@ -287,11 +287,13 @@ pub trait Context: Send + Sync + __private::Sealed + __private::Log {
     ///
     /// On success it brings the context's views and sagas up to date, sends the commands the
     /// sagas reacted with, and repeats until no saga has a command left to send, for at most
-    /// [`ROUNDS`] rounds; then it returns the events the command recorded. A saga's command
-    /// that is rejected is dropped. The events are recorded even when the store fails while
+    /// [`ROUNDS`] rounds; then it returns the events the command recorded. Only the views and
+    /// sagas that listen for an event recorded in a round take part in it; the others read past
+    /// those events the next time they do. A saga's command that is rejected goes to the saga's
+    /// [`Rejected`] impl. The events are recorded even when the store fails while
     /// updating a view or a saga, or when a saga's command can't be sent; that work is done by
-    /// the next `send`. When sagas keep reacting past [`ROUNDS`] rounds it returns
-    /// [`SendError::Runaway`], with the command's events recorded.
+    /// the next `send` that involves that view or saga. When sagas keep reacting past
+    /// [`ROUNDS`] rounds it returns [`SendError::Runaway`], with the command's events recorded.
     ///
     /// Takes a command struct, an aggregate's command enum, or the context's own command enum,
     /// such as one read from the wire. A command of an aggregate outside this context doesn't
@@ -403,6 +405,8 @@ pub trait View:
     fn key_of(id: &dyn core::any::Any, event: &dyn core::any::Any) -> Option<Self::Key>;
     #[doc(hidden)]
     fn apply(&mut self, event: &dyn core::any::Any);
+    #[doc(hidden)]
+    fn listens(event: &dyn core::any::Any) -> bool;
 }
 
 /// Marks that a view lists event `E` in its `on(...)`. Implemented only by `#[oath::view]`.
@@ -446,8 +450,8 @@ pub trait Project<E: BelongsToAggregate>: Subscribes<E> {
 /// added, so it reacts only to events recorded after that. It saves its state, its position,
 /// and the commands it reacted with together, then sends the commands, so a crash loses none.
 /// Each command has a [`CommandId`], and the store records a command once even when it is sent
-/// again after a crash. A saga never sees a rejection: model a failure it must handle as an
-/// event it reacts to.
+/// again after a crash. When the context rejects one of its commands, the saga's [`Rejected`]
+/// impl, which every saga has, decides what to send instead.
 pub trait Saga:
     Default
     + Send
@@ -456,6 +460,7 @@ pub trait Saga:
     + serde::Serialize
     + serde::de::DeserializeOwned
     + SagaOf
+    + Rejected
     + __private::Sealed
     + __private::Named
 {
@@ -474,6 +479,28 @@ pub trait Saga:
     fn key_of(id: &dyn core::any::Any, event: &dyn core::any::Any) -> Option<Self::Key>;
     #[doc(hidden)]
     fn react_to(&mut self, key: &Self::Key, event: &dyn core::any::Any) -> Commands<Self>;
+    #[doc(hidden)]
+    fn listens(event: &dyn core::any::Any) -> bool;
+}
+
+/// What a saga does when the context rejects one of its commands. Every saga implements it,
+/// so no rejection goes unhandled: return the commands that put things right, such as a
+/// refund, or none to leave the state as `rejected` updated it.
+#[diagnostic::on_unimplemented(
+    message = "saga `{Self}` does not say what to do when one of its commands is rejected",
+    label = "`{Self}` needs `impl Rejected`",
+    note = "implement oath::Rejected for {Self}: `fn rejected(&mut self, key, rejection) -> Commands<Self>`"
+)]
+pub trait Rejected: SagaOf + Sized {
+    /// Updates the state `key` after the context rejected the command it sent from it, and
+    /// returns the commands to send next.
+    fn rejected(
+        &mut self,
+        key: &<Self as Saga>::Key,
+        rejection: &<Self::Context as Context>::Rejection,
+    ) -> Commands<Self>
+    where
+        Self: Saga;
 }
 
 /// The one context a saga belongs to. Implemented by `#[oath::context]` for every saga it
@@ -685,7 +712,8 @@ pub trait SagaStore<S: Saga>: Send + Sync + 'static {
     fn row(&self, key: &S::Key) -> impl Future<Output = Result<Option<Row<S>>, Self::Error>> + Send;
 
     /// In one transaction, saves the states of `reacted`, replaces the saga's checkpoint with
-    /// its checkpoint, and adds its commands to the ones still to be sent, but only when the
+    /// its checkpoint, adds its commands to the ones still to be sent, and removes the one
+    /// [`Reacted::delivered`] names, but only when the
     /// saved checkpoint is still at position [`Reacted::expected`] (`Position(0)` for none).
     /// Otherwise saves nothing and returns [`AppendError::Conflict`]. Only a context builds a
     /// [`Reacted`].
@@ -703,6 +731,7 @@ pub trait SagaStore<S: Saga>: Send + Sync + 'static {
 #[serde(bound = "")]
 pub struct Pending<S: Saga> {
     id: CommandId,
+    key: S::Key,
     command: <S::Context as Context>::Command,
 }
 
@@ -720,6 +749,7 @@ pub struct Reacted<S: Saga> {
     checkpoint: Checkpoint<S>,
     rows: Vec<(S::Key, Row<S>)>,
     pending: Vec<Pending<S>>,
+    delivered: Option<CommandId>,
 }
 
 impl<S: Saga> Reacted<S> {
@@ -738,6 +768,11 @@ impl<S: Saga> Reacted<S> {
     /// The commands to add to the ones still to be sent, in order.
     pub fn pending(&self) -> &[Pending<S>] {
         &self.pending
+    }
+    /// The command to remove from the ones still to be sent, when the saga handled its
+    /// rejection.
+    pub fn delivered(&self) -> Option<&CommandId> {
+        self.delivered.as_ref()
     }
 }
 
@@ -1034,6 +1069,9 @@ impl<S: Saga> SagaStore<S> for MemoryStore {
             outbox.checkpoint = Some(write(reacted.checkpoint()));
             for (key, row) in reacted.rows() {
                 outbox.by_key.insert(key.clone(), write(row));
+            }
+            if let Some(delivered) = reacted.delivered() {
+                outbox.pending.retain(|(pending, _)| pending != delivered);
             }
             outbox.pending.extend(reacted.pending().iter().map(|pending| (pending.id().clone(), write(pending))));
             Ok(())
@@ -1473,6 +1511,7 @@ pub mod __private {
     /// The event struct inside one variant of an aggregate's event enum.
     pub trait Inner {
         fn into_any(self) -> Box<dyn core::any::Any + Send + Sync>;
+        fn as_any(&self) -> &dyn core::any::Any;
     }
 
     /// What a context needs of a [`Store`](crate::Store): the same methods, as boxed futures
@@ -1541,6 +1580,7 @@ pub mod __private {
             checkpoint: crate::Checkpoint { schema: 0, position: log.head().await?, view: core::marker::PhantomData },
             rows: Vec::new(),
             pending: Vec::new(),
+            delivered: None,
         };
         match store.dyn_save(&reacted).await {
             // Another context gave it one first.
@@ -1578,7 +1618,7 @@ pub mod __private {
                 let commands = rows.get_mut(&key).expect("loaded above").react_to(&key, &*entry.event);
                 for (n, command) in commands.into_iter().enumerate() {
                     let id = crate::CommandId(format!("{}:{}:{n}", S::NAME, entry.position.0));
-                    pending.push(crate::Pending { id, command });
+                    pending.push(crate::Pending { id, key: key.clone(), command });
                 }
             }
             let reacted = crate::Reacted {
@@ -1592,6 +1632,7 @@ pub mod __private {
                     })
                     .collect(),
                 pending,
+                delivered: None,
             };
             match store.dyn_save(&reacted).await {
                 Ok(()) | Err(crate::AppendError::Conflict | crate::AppendError::Duplicate) => continue,
@@ -1600,25 +1641,69 @@ pub mod __private {
         }
     }
 
-    /// Sends the commands saga `S` reacted with, and returns how many it sent. A command that
-    /// is recorded, already recorded, or rejected is sent; one that conflicts stays to be sent.
-    pub async fn deliver<S, St>(store: &St, context: &S::Context) -> Result<usize, BoxError>
+    /// What [`deliver`] did: the events the saga's commands recorded, and whether handling a
+    /// rejection gave the saga more commands to send.
+    pub struct Delivered<E> {
+        pub events: Vec<E>,
+        pub more: bool,
+    }
+
+    /// Sends the commands saga `S` reacted with. A command that is recorded or already recorded
+    /// is sent; a rejected one goes to the saga's [`Rejected`](crate::Rejected) impl, whose
+    /// commands replace it in one save; one that conflicts stays to be sent.
+    pub async fn deliver<S, St>(
+        store: &St,
+        context: &S::Context,
+    ) -> Result<Delivered<<S::Context as crate::Context>::Event>, BoxError>
     where
         S: crate::Saga,
         St: DynSagaStore<S> + ?Sized,
     {
-        let mut sent = 0;
+        let mut delivered = Delivered { events: Vec::new(), more: false };
         for pending in store.dyn_pending().await? {
-            match crate::Context::dispatch(context, pending.command, Some(&pending.id)).await {
-                Ok(_) | Err(crate::SendError::Rejected(_)) => {}
+            let rejection = match crate::Context::dispatch(context, pending.command, Some(&pending.id)).await {
+                Ok(events) => {
+                    delivered.events.extend(events);
+                    store.dyn_delivered(&pending.id).await?;
+                    continue;
+                }
+                Err(crate::SendError::Rejected(rejection)) => rejection,
                 Err(crate::SendError::Conflict | crate::SendError::Runaway) => continue,
                 Err(crate::SendError::Store(error)) => return Err(error),
                 Err(crate::SendError::Unreplayable(error)) => return Err(Box::new(error)),
+            };
+            loop {
+                let Some(saved) = store.dyn_checkpoint().await? else { break };
+                let mut row = match store.dyn_row(&pending.key).await? {
+                    Some(row) => row.decode()?,
+                    None => S::default(),
+                };
+                let commands = crate::Rejected::rejected(&mut row, &pending.key, &rejection);
+                delivered.more |= !commands.is_empty();
+                let state = serde_value::to_value(&row).expect("a saga is written through serde");
+                let reacted = crate::Reacted {
+                    expected: saved.position,
+                    checkpoint: crate::Checkpoint { schema: 0, position: saved.position, view: core::marker::PhantomData },
+                    rows: vec![(pending.key.clone(), crate::Row { schema: 0, state, view: core::marker::PhantomData })],
+                    pending: commands
+                        .into_iter()
+                        .enumerate()
+                        .map(|(n, command)| crate::Pending {
+                            id: crate::CommandId(format!("{}:rejected:{n}", pending.id.0)),
+                            key: pending.key.clone(),
+                            command,
+                        })
+                        .collect(),
+                    delivered: Some(pending.id.clone()),
+                };
+                match store.dyn_save(&reacted).await {
+                    Ok(()) => break,
+                    Err(crate::AppendError::Conflict | crate::AppendError::Duplicate) => continue,
+                    Err(crate::AppendError::Store(error)) => return Err(error),
+                }
             }
-            store.dyn_delivered(&pending.id).await?;
-            sent += 1;
         }
-        Ok(sent)
+        Ok(delivered)
     }
 
     fn boxed<E: std::error::Error + Send + Sync + 'static>(error: E) -> BoxError {

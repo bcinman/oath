@@ -692,6 +692,9 @@ fn grouping_enum(
                 fn into_any(self) -> ::std::boxed::Box<dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync> {
                     match self { #( Self::#names(inner) => ::std::boxed::Box::new(inner), )* }
                 }
+                fn as_any(&self) -> &dyn ::core::any::Any {
+                    match self { #( Self::#names(inner) => inner, )* }
+                }
             }
         },
         _ => TokenStream2::new(),
@@ -1383,6 +1386,8 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
          each saga."
     );
     let first = &aggregates[0];
+    let busy: Vec<_> = sagas.iter().map(|saga| format_ident!("__busy_{}", saga)).collect();
+    let event_any = format_ident!("__{}_event_any", name);
     // Each command goes to its aggregate.
     let send_arms = aggregates.iter().map(|aggregate| {
         quote! {
@@ -1503,6 +1508,13 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
         #vis use #module::#name;
         #( #recorded )*
 
+        /// The event struct inside one of the context's events.
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #event_any(event: &#event) -> &dyn ::core::any::Any {
+            match event { #( #event::#aggregates(inner) => ::oath::__private::Inner::as_any(inner), )* }
+        }
+
         // The context is a struct with a private field holding its store, defined in a private
         // module, so no code but `send` can append events.
         #[doc(hidden)]
@@ -1516,12 +1528,13 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
             #( #struct_attrs )*
             #inner_vis struct #name {
                 store: ::std::boxed::Box<dyn #store_trait>,
+                recover: bool,
             }
 
             impl #name {
                 #[doc = #new_doc]
                 pub fn new(store: impl #stores 'static) -> Self {
-                    Self { store: ::std::boxed::Box::new(store) }
+                    Self { store: ::std::boxed::Box::new(store), recover: true }
                 }
             }
 
@@ -1583,23 +1596,59 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                 > + ::core::marker::Send {
                     let command: #command = command.into();
                     async move {
-                        let context = &*self;
-                        // A saga added since the last send starts at the end of the log, so it
-                        // reacts to this command's events and none before.
-                        #( let _ = ::oath::__private::start::<#sagas, _, _>(&*context.store, context).await; )*
-                        let events = ::oath::Context::dispatch(context, command, ::core::option::Option::None).await?;
-                        // The events are recorded. A view or saga the store fails to update, or a
-                        // saga command it fails to send, is taken up by the next send.
-                        for _ in 0..::oath::ROUNDS {
-                            #( let _ = ::oath::__private::catch_up::<#views, _, _>(&*context.store, context).await; )*
-                            #( let _ = ::oath::__private::react::<#sagas, _, _>(&*context.store, context).await; )*
-                            let mut sent = 0;
-                            #( sent += ::oath::__private::deliver::<#sagas, _>(&*context.store, context).await.unwrap_or(0); )*
-                            if sent == 0 {
-                                return ::core::result::Result::Ok(events);
-                            }
+                        // On a context's first send, and after a store failure, every saga
+                        // catches up: a saga added since then starts at the end of the log, and
+                        // one that missed an event, as after a crash, takes it in.
+                        let recover = self.recover;
+                        if recover {
+                            #( let _ = ::oath::__private::start::<#sagas, _, _>(&*self.store, &*self).await; )*
                         }
-                        ::core::result::Result::Err(::oath::SendError::Runaway)
+                        let context = &*self;
+                        let events = ::oath::Context::dispatch(context, command, ::core::option::Option::None).await?;
+                        // The events are recorded. Each round, only the views and sagas that
+                        // listen for an event the round recorded take part, except that the
+                        // first round sends every saga's outstanding commands. A view the store
+                        // fails to update catches up the next time it takes part or is read.
+                        let mut fresh: ::std::vec::Vec<#event> = events.clone();
+                        let mut failed = false;
+                        #( let mut #busy = true; )*
+                        let mut result = ::core::result::Result::Err(::oath::SendError::Runaway);
+                        for round in 0..::oath::ROUNDS {
+                            let listening = |listens: fn(&dyn ::core::any::Any) -> bool| {
+                                fresh.iter().any(|event| listens(#event_any(event)))
+                            };
+                            #(
+                                if listening(<#views as ::oath::View>::listens) {
+                                    let _ = ::oath::__private::catch_up::<#views, _, _>(&*context.store, context).await;
+                                }
+                            )*
+                            #(
+                                if (recover && round == 0) || listening(<#sagas as ::oath::Saga>::listens) {
+                                    failed |= ::oath::__private::react::<#sagas, _, _>(&*context.store, context).await.is_err();
+                                    #busy = true;
+                                }
+                            )*
+                            let mut next = ::std::vec::Vec::new();
+                            #(
+                                if #busy {
+                                    #busy = false;
+                                    match ::oath::__private::deliver::<#sagas, _>(&*context.store, context).await {
+                                        ::core::result::Result::Ok(delivered) => {
+                                            next.extend(delivered.events);
+                                            #busy = delivered.more;
+                                        }
+                                        ::core::result::Result::Err(_) => failed = true,
+                                    }
+                                }
+                            )*
+                            if next.is_empty() #( && !#busy )* {
+                                result = ::core::result::Result::Ok(events);
+                                break;
+                            }
+                            fresh = next;
+                        }
+                        self.recover = failed;
+                        result
                     }
                 }
 
@@ -1719,6 +1768,9 @@ fn view_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
                 )*
                 ::core::option::Option::None
             }
+            fn listens(event: &dyn ::core::any::Any) -> bool {
+                false #( || event.is::<#events>() )*
+            }
             fn apply(&mut self, event: &dyn ::core::any::Any) {
                 #(
                     if let ::core::option::Option::Some(event) = event.downcast_ref::<#events>() {
@@ -1770,6 +1822,9 @@ fn saga_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
                     }
                 )*
                 ::core::option::Option::None
+            }
+            fn listens(event: &dyn ::core::any::Any) -> bool {
+                false #( || event.is::<#events>() )*
             }
             fn react_to(&mut self, key: &#key, event: &dyn ::core::any::Any) -> ::oath::Commands<Self> {
                 #(

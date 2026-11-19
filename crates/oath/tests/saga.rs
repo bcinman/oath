@@ -197,6 +197,9 @@ where
         Store::<A>::append(&*self.store, decided).await
     }
     async fn head(&self) -> Result<Position, Self::Error> { Store::<A>::head(&*self.store).await }
+    async fn recorded(&self, id: &A::Id, command: &oath::CommandId) -> Result<bool, Self::Error> {
+        Store::<A>::recorded(&*self.store, id, command).await
+    }
     async fn log(&self, after: Position, limit: usize) -> Result<Vec<Logged<A>>, Self::Error> {
         Store::<A>::log(&*self.store, after, limit).await
     }
@@ -378,7 +381,7 @@ impl React<Shouted> for Repeat {
 #[test]
 fn sagas_that_react_to_each_other_without_end_stop_after_the_rounds() {
     let store = Arc::new(MemoryStore::default());
-    let mut canyon = Canyon::new(StoreOf(store.clone()));
+    let canyon = Canyon::new(StoreOf(store.clone()));
     let error = block_on(canyon.send(Shout { echo: EchoId::new("ech_1").unwrap() })).unwrap_err();
     assert!(matches!(error, SendError::Runaway), "{error}");
     // The shout and one echo per round are recorded.
@@ -399,6 +402,9 @@ impl Store<Echo> for StoreOf {
         Store::<Echo>::append(&*self.0, decided).await
     }
     async fn head(&self) -> Result<Position, Self::Error> { Store::<Echo>::head(&*self.0).await }
+    async fn recorded(&self, id: &EchoId, command: &oath::CommandId) -> Result<bool, Self::Error> {
+        Store::<Echo>::recorded(&*self.0, id, command).await
+    }
     async fn log(&self, after: Position, limit: usize) -> Result<Vec<Logged<Echo>>, Self::Error> {
         Store::<Echo>::log(&*self.0, after, limit).await
     }

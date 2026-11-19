@@ -31,6 +31,9 @@
 //!   `#[oath::saga(key = ..., on(...))]`. See [`Saga`].
 //! - A **view** is a read model that the events of a context keep up to date. Declare it on a
 //!   struct with `#[oath::view(on(...))]`, naming the events it subscribes to. See [`View`].
+//! - A **replica** runs a context on a client, such as in a browser or on a phone: it predicts
+//!   the client's commands at once, and a server that has the final say confirms or rejects
+//!   them. See [`replica`].
 //!
 //! `#[oath::command]`, `#[oath::event]`, and `#[oath::rejection]` derive `Debug`, `Clone`,
 //! `PartialEq`, and serde's `Serialize` and `Deserialize`, so every command, event, and
@@ -119,6 +122,8 @@
 //! assert_eq!(order.decide(&pay), Ok(vec![OrderPaid { amount: 40 }.into()]));
 //! # }
 //! ```
+
+pub mod replica;
 
 pub use oath_macros::{aggregate, command, context, event, id, rejection, saga, state, value, view};
 
@@ -269,13 +274,39 @@ impl std::error::Error for Unreplayable {}
 /// aggregates in one context may have a command with the same name. Events and rejections go
 /// under their aggregate's name, such as `{"Order":{"kind":"OrderPlaced","total":40}}`, since
 /// every aggregate has a `NotAllowed` rejection.
-pub trait Context: Send + Sync + __private::Sealed + __private::Log {
+pub trait Context: Sized + Send + Sync + 'static + __private::Sealed + __private::Log {
     /// The enum of every command the context's aggregates decide.
-    type Command: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned;
+    type Command: Clone + core::fmt::Debug + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned;
     /// The enum of every event the context's aggregates record.
-    type Event;
+    type Event: Clone + core::fmt::Debug + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned;
     /// The enum of every reason the context's aggregates reject a command for.
-    type Rejection;
+    type Rejection: Clone + PartialEq + core::fmt::Debug + Send + 'static + serde::Serialize + serde::de::DeserializeOwned;
+    /// The enum naming one aggregate instance of the context, such as
+    /// `ShopInstance::Order(OrderId)`: what a [`replica`] follows.
+    type Instance: Clone
+        + Eq
+        + core::hash::Hash
+        + core::fmt::Debug
+        + Send
+        + Sync
+        + 'static
+        + serde::Serialize
+        + serde::de::DeserializeOwned;
+    /// The enum naming one row of one of the context's views, such as
+    /// `ShopRow::Status(OrderId)`: what a [`replica`] watches.
+    type Row: Clone
+        + Eq
+        + core::hash::Hash
+        + core::fmt::Debug
+        + Send
+        + Sync
+        + 'static
+        + serde::Serialize
+        + serde::de::DeserializeOwned;
+
+    /// Identifies the context's commands, events, rejections, states, and views as declared.
+    /// A [`replica`] and a server agree on the model only when they have the same fingerprint.
+    const FINGERPRINT: u64;
 
     /// Routes `command` to the aggregate instance it targets and records what it decides.
     ///
@@ -299,9 +330,20 @@ pub trait Context: Send + Sync + __private::Sealed + __private::Log {
     /// such as one read from the wire. A command of an aggregate outside this context doesn't
     /// compile.
     fn send(
-        &mut self,
+        &self,
         command: impl Into<Self::Command>,
-    ) -> impl Future<Output = Result<Vec<Self::Event>, SendError<Self::Rejection>>> + Send;
+    ) -> impl Future<Output = Result<Vec<Self::Event>, SendError<Self::Rejection>>> + Send {
+        let command = command.into();
+        async move { self.send_as(command, None).await }
+    }
+
+    /// `send`, recording the command under `id`.
+    #[doc(hidden)]
+    fn send_as<'a>(
+        &'a self,
+        command: Self::Command,
+        id: Option<&'a CommandId>,
+    ) -> __private::BoxFuture<'a, __private::Sent<Self>>;
 
     #[doc(hidden)]
     fn dispatch<'a>(
@@ -309,6 +351,52 @@ pub trait Context: Send + Sync + __private::Sealed + __private::Log {
         command: Self::Command,
         id: Option<&'a CommandId>,
     ) -> __private::BoxFuture<'a, __private::Sent<Self>>;
+
+    /// The events of the log after `after`, typed, and the position they reach.
+    #[doc(hidden)]
+    fn changes(
+        &self,
+        after: Position,
+    ) -> __private::BoxFuture<'_, __private::Changes<Self>>;
+
+    /// The current version of `instance` and its state, as serde writes it; `None` before its
+    /// first event.
+    #[doc(hidden)]
+    fn state_of<'a>(
+        &'a self,
+        instance: &'a Self::Instance,
+    ) -> __private::BoxFuture<'a, Result<(Version, Option<serde_value::Value>), StoreError>>;
+
+    /// The current value of `row`, as serde writes it.
+    #[doc(hidden)]
+    fn current<'a>(&'a self, row: &'a Self::Row) -> __private::BoxFuture<'a, Result<serde_value::Value, StoreError>>;
+
+    /// `row`, whose value is `value` (`None` for the view's `Default`), after `event` of
+    /// `instance`; `None` when the event doesn't update the row.
+    #[doc(hidden)]
+    fn project_in(
+        row: &Self::Row,
+        value: Option<&serde_value::Value>,
+        instance: &Self::Instance,
+        event: &Self::Event,
+    ) -> Option<serde_value::Value>;
+
+    /// The instance `command` targets.
+    #[doc(hidden)]
+    fn target(command: &Self::Command) -> Self::Instance;
+
+    /// What the instance in `state` (`None` for none yet) decides for `command`.
+    #[doc(hidden)]
+    fn decide_in(state: Option<&serde_value::Value>, command: &Self::Command) -> Result<Vec<Self::Event>, Self::Rejection>;
+
+    /// The state of an instance in `state` after `event`; `None` when the state can't be read
+    /// or has no transition for the event.
+    #[doc(hidden)]
+    fn evolve_in(state: Option<&serde_value::Value>, event: &Self::Event) -> Option<serde_value::Value>;
+
+    /// The instance's id and the event struct, for a view to take in.
+    #[doc(hidden)]
+    fn erase(instance: Self::Instance, event: Self::Event) -> (__private::AnyBox, __private::AnyBox);
 
     /// The row `key` of view `V`, after the view has taken in every event in the store's log.
     /// A row no event has touched yet is the view's `Default`. A view the context doesn't list
@@ -623,6 +711,12 @@ pub trait Store<A: Aggregate>: Send + Sync + 'static {
     /// when it has none.
     fn head(&self) -> impl Future<Output = Result<Position, Self::Error>> + Send;
 
+    /// Whether instance `id` recorded the command `command`, which [`append`](Self::append)
+    /// keeps with its events. A context asks before it reports a rejection of a command with an
+    /// id, since a command sent again may be rejected only because it was recorded the first
+    /// time.
+    fn recorded(&self, id: &A::Id, command: &CommandId) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
     /// The first `limit` events of aggregate `A` in the store's log after position `after`,
     /// in order.
     fn log(&self, after: Position, limit: usize) -> impl Future<Output = Result<Vec<Logged<A>>, Self::Error>> + Send;
@@ -634,6 +728,8 @@ pub struct Logged<A: Aggregate> {
     pub position: Position,
     /// The instance that recorded it.
     pub id: A::Id,
+    /// The instance's version with this event: `Version(1)` for its first.
+    pub version: Version,
     /// The event.
     pub event: A::Event,
 }
@@ -924,7 +1020,7 @@ struct Memory {
 /// The instances of one aggregate in a [`MemoryStore`], and its part of the log.
 struct Instances<A: Aggregate> {
     by_id: std::collections::HashMap<A::Id, Stored>,
-    log: Vec<(Position, serde_value::Value, serde_value::Value)>,
+    log: Vec<(Position, serde_value::Value, Version, serde_value::Value)>,
 }
 
 impl<A: Aggregate> Default for Instances<A> {
@@ -1011,12 +1107,20 @@ impl<A: Aggregate> Store<A> for MemoryStore {
             for event in decided.events() {
                 *head += 1;
                 stored.events.push(write(event));
-                instances.log.push((Position(*head), write(decided.id()), write(event)));
+                let version = Version(stored.events.len() as u64);
+                instances.log.push((Position(*head), write(decided.id()), version, write(event)));
             }
             stored.snapshot = Some(write(decided.snapshot()));
             Ok(())
         });
         core::future::ready(appended)
+    }
+
+    fn recorded(&self, id: &A::Id, command: &CommandId) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        let recorded = self.with(|instances: &mut Instances<A>, _| {
+            instances.by_id.get(id).is_some_and(|stored| stored.commands.contains(command))
+        });
+        core::future::ready(Ok(recorded))
     }
 
     fn head(&self) -> impl Future<Output = Result<Position, Self::Error>> + Send {
@@ -1029,7 +1133,12 @@ impl<A: Aggregate> Store<A> for MemoryStore {
             instances.log[start..]
                 .iter()
                 .take(limit)
-                .map(|(position, id, event)| Logged { position: *position, id: read_back(id), event: read_back(event) })
+                .map(|(position, id, version, event)| Logged {
+                    position: *position,
+                    id: read_back(id),
+                    version: *version,
+                    event: read_back(event),
+                })
                 .collect()
         });
         core::future::ready(Ok(logged))
@@ -1406,6 +1515,10 @@ pub mod __private {
     )]
     pub trait Holds<V: crate::View> {
         fn view_store(&self) -> &dyn DynViewStore<V>;
+        /// The context's name for row `key` of `V`.
+        fn row_of(key: V::Key) -> <Self as crate::Context>::Row
+        where
+            Self: crate::Context;
     }
 
     /// How many events of each aggregate a context reads from the log at a time.
@@ -1429,12 +1542,87 @@ pub mod __private {
     }
 
     impl Entry {
-        pub fn of<A: crate::Aggregate>(logged: crate::Logged<A>) -> Entry
-        where
-            A::Event: Inner,
-        {
-            Entry { position: logged.position, id: Box::new(logged.id), event: logged.event.into_any() }
+        pub fn of<C: crate::Context>(change: Change<C>) -> Entry {
+            let (id, event) = C::erase(change.instance, change.event);
+            Entry { position: change.position, id, event }
         }
+    }
+
+    pub type AnyBox = Box<dyn core::any::Any + Send + Sync>;
+
+    /// The next events of a context's log, and the position up to which they are all of them.
+    pub type Changes<C> = Result<(Vec<Change<C>>, crate::Position), BoxError>;
+
+    /// One event in a context's log, typed by the context.
+    pub struct Change<C: crate::Context> {
+        pub position: crate::Position,
+        pub instance: C::Instance,
+        pub version: crate::Version,
+        pub event: C::Event,
+    }
+
+    /// The current version of instance `id` and its state, as serde writes it.
+    pub async fn state_of<A: crate::Aggregate, S: DynStore<A> + ?Sized>(
+        store: &S,
+        id: &A::Id,
+    ) -> Result<(crate::Version, Option<serde_value::Value>), BoxError> {
+        let (state, version) = load::<A, S, ()>(store, id).await.map_err(|error| match error {
+            crate::SendError::Unreplayable(error) => Box::new(error) as BoxError,
+            crate::SendError::Store(error) => error,
+            _ => unreachable!("loading only fails in the store or on replay"),
+        })?;
+        Ok((version, (version.0 > 0).then(|| state.save())))
+    }
+
+    /// The current row `key` of view `V`, as serde writes it.
+    pub async fn current<V: crate::View, C: crate::Context + Holds<V>>(context: &C, key: &V::Key) -> Result<serde_value::Value, BoxError> {
+        let row: V = crate::Context::view::<V>(context, key).await?;
+        Ok(serde_value::to_value(&row).expect("a view row is written through serde"))
+    }
+
+    /// Row `key` of view `V`, whose value is `value`, after `event` of `instance`; `None`
+    /// when the event doesn't update the row.
+    pub fn project_in<V: crate::View, C: crate::Context>(
+        key: &V::Key,
+        value: Option<&serde_value::Value>,
+        instance: &C::Instance,
+        event: &C::Event,
+    ) -> Option<serde_value::Value> {
+        let (id, event) = C::erase(instance.clone(), event.clone());
+        if V::key_of(&*id, &*event).as_ref() != Some(key) {
+            return None;
+        }
+        let mut row: V = value.and_then(|value| value.clone().deserialize_into().ok()).unwrap_or_default();
+        row.apply(&*event);
+        Some(serde_value::to_value(&row).expect("a view row is written through serde"))
+    }
+
+    /// What an aggregate in `state` decides, as the context's events or rejection.
+    pub fn decide_in<A: crate::Aggregate, E, R>(
+        state: Option<&serde_value::Value>,
+        command: &A::Command,
+        event: fn(A::Event) -> E,
+        rejection: fn(A::Rejection) -> R,
+    ) -> Result<Vec<E>, R> {
+        let current = state.and_then(|state| A::restore(state.clone())).unwrap_or_default();
+        current.decide(command).map(|events| events.into_iter().map(event).collect()).map_err(rejection)
+    }
+
+    /// The state of an aggregate in `state` after `event`.
+    pub fn evolve_in<A: crate::Aggregate>(state: Option<&serde_value::Value>, event: &A::Event) -> Option<serde_value::Value> {
+        let current = match state {
+            Some(state) => A::restore(state.clone())?,
+            None => A::default(),
+        };
+        Some(current.evolve(event).ok()?.save())
+    }
+
+    /// The instance id and event struct of one aggregate's event.
+    pub fn erase<A: crate::Aggregate>(id: A::Id, event: A::Event) -> (AnyBox, AnyBox)
+    where
+        A::Event: Inner,
+    {
+        (Box::new(id), event.into_any())
     }
 
     /// Brings view `V` up to date with the log: takes in the events after its checkpoint, a
@@ -1524,6 +1712,7 @@ pub mod __private {
             decided: &'a crate::Decided<A>,
         ) -> BoxFuture<'a, Result<(), crate::AppendError<BoxError>>>;
         fn dyn_head(&self) -> BoxFuture<'_, Result<crate::Position, BoxError>>;
+        fn dyn_recorded<'a>(&'a self, id: &'a A::Id, command: &'a crate::CommandId) -> BoxFuture<'a, Result<bool, BoxError>>;
         fn dyn_log(&self, after: crate::Position, limit: usize) -> BoxFuture<'_, Result<Vec<crate::Logged<A>>, BoxError>>;
     }
 
@@ -1758,6 +1947,9 @@ pub mod __private {
         fn dyn_head(&self) -> BoxFuture<'_, Result<crate::Position, BoxError>> {
             Box::pin(async move { crate::Store::head(self).await.map_err(boxed) })
         }
+        fn dyn_recorded<'a>(&'a self, id: &'a A::Id, command: &'a crate::CommandId) -> BoxFuture<'a, Result<bool, BoxError>> {
+            Box::pin(async move { crate::Store::recorded(self, id, command).await.map_err(boxed) })
+        }
         fn dyn_log(&self, after: crate::Position, limit: usize) -> BoxFuture<'_, Result<Vec<crate::Logged<A>>, BoxError>> {
             Box::pin(async move { crate::Store::log(self, after, limit).await.map_err(boxed) })
         }
@@ -1767,6 +1959,8 @@ pub mod __private {
     pub trait Persist: Sized {
         /// Identifies the aggregate's state structs, from their `#[oath::state]` fingerprints.
         const SCHEMA: u64;
+        /// Identifies the aggregate's commands, events, and rejections, as declared.
+        const WIRE: u64;
         fn save(&self) -> serde_value::Value;
         fn restore(state: serde_value::Value) -> Option<Self>;
     }
@@ -1829,18 +2023,16 @@ pub mod __private {
         use crate::{AppendError, SendError, Snapshot, Version};
         let id = crate::Command::target(command);
         for _ in 0..ATTEMPTS {
-            let loaded = store.dyn_load(id).await.map_err(SendError::Store)?;
-            let (start, version, events) = match loaded.snapshot {
-                None => (A::default(), Version(0), loaded.events),
-                Some(snapshot) => match (snapshot.schema == A::SCHEMA).then(|| A::restore(snapshot.state)).flatten() {
-                    Some(state) => (state, snapshot.version, loaded.events),
-                    // Written by code whose states have since changed: replay every event.
-                    None => (A::default(), Version(0), store.dyn_events(id).await.map_err(SendError::Store)?),
-                },
+            let (current, version) = load::<A, S, _>(store, id).await?;
+            let recorded = match current.decide(command) {
+                Ok(recorded) => recorded,
+                // A command sent again, which the instance recorded the first time.
+                Err(_) if match command_id {
+                    Some(command_id) => store.dyn_recorded(id, command_id).await.map_err(SendError::Store)?,
+                    None => false,
+                } => return Ok(Vec::new()),
+                Err(rejection) => return Err(SendError::Rejected(rejection)),
             };
-            let version = Version(version.0 + events.len() as u64);
-            let current = events.iter().try_fold(start, A::evolve).map_err(SendError::Unreplayable)?;
-            let recorded = current.decide(command).map_err(SendError::Rejected)?;
             let next = recorded.iter().try_fold(current, A::evolve).map_err(SendError::Unreplayable)?;
             let decided = crate::Decided {
                 id: id.clone(),
@@ -1863,6 +2055,26 @@ pub mod __private {
             }
         }
         Err(SendError::Conflict)
+    }
+
+    /// The current state of instance `id` and its version: its snapshot and the events after
+    /// it, or every event when the snapshot was written by code whose states have since changed.
+    async fn load<A: crate::Aggregate, S: DynStore<A> + ?Sized, R>(
+        store: &S,
+        id: &A::Id,
+    ) -> Result<(A, crate::Version), crate::SendError<R>> {
+        use crate::{SendError, Version};
+        let loaded = store.dyn_load(id).await.map_err(SendError::Store)?;
+        let (start, version, events) = match loaded.snapshot {
+            None => (A::default(), Version(0), loaded.events),
+            Some(snapshot) => match (snapshot.schema == A::SCHEMA).then(|| A::restore(snapshot.state)).flatten() {
+                Some(state) => (state, snapshot.version, loaded.events),
+                None => (A::default(), Version(0), store.dyn_events(id).await.map_err(SendError::Store)?),
+            },
+        };
+        let version = Version(version.0 + events.len() as u64);
+        let current = events.iter().try_fold(start, A::evolve).map_err(SendError::Unreplayable)?;
+        Ok((current, version))
     }
 
     /// Decodes the `kind` and fields [`read_tagged`] returned as the tagged enum `T`.

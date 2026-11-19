@@ -235,6 +235,9 @@ where
     async fn head(&self) -> Result<Position, Self::Error> {
         Store::<A>::head(&*self.store).await
     }
+    async fn recorded(&self, id: &A::Id, command: &oath::CommandId) -> Result<bool, Self::Error> {
+        Store::<A>::recorded(&*self.store, id, command).await
+    }
     async fn log(&self, after: Position, limit: usize) -> Result<Vec<Logged<A>>, Self::Error> {
         Store::<A>::log(&*self.store, after, limit).await
     }

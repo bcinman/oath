@@ -203,11 +203,16 @@ fn message_struct(item: ItemStruct, kind: Kind, stable_name: Option<LitStr>) -> 
     let trait_path = kind.trait_path();
     let (impl_generics, type_generics, where_clause) = item.generics.split_for_impl();
     let standard = standard_derives();
+    let declared = without_docs(&item);
+    let fingerprint = fingerprint(quote!(#name_str #declared));
     Ok(quote! {
         #standard
         #item
         impl #impl_generics ::oath::__private::Named for #name #type_generics #where_clause {
             const NAME: &'static str = #name_str;
+        }
+        impl #impl_generics ::oath::__private::Persisted for #name #type_generics #where_clause {
+            const FINGERPRINT: u64 = #fingerprint;
         }
         impl #impl_generics #trait_path for #name #type_generics #where_clause {
             fn name(&self) -> &'static str { #name_str }
@@ -598,6 +603,25 @@ fn value_impl(args: TokenStream2, item: TokenStream2, is_id: bool) -> Result<Tok
     };
     let serde = quote!(::oath::__private::serde);
     let id = if is_id { quote!(impl ::oath::Id for #name {}) } else { quote!() };
+    // A replica can make an id around a String whose only rule is a prefix: no other rule can
+    // fail for the text it makes.
+    let is_string = matches!(&inner, Type::Path(path) if path.qself.is_none() && path.path.is_ident("String"));
+    let prefixes: Vec<_> = rules.iter().filter_map(|rule| match &rule.kind {
+        RuleKind::Prefix(prefix) => Some(prefix.clone()),
+        _ => None,
+    }).collect();
+    let fresh = if is_id && is_string && prefixes.len() == rules.len() {
+        let prefix = prefixes.first().map_or_else(String::new, LitStr::value);
+        quote! {
+            impl ::oath::replica::Fresh for #name {
+                fn fresh(suffix: &str) -> Self {
+                    Self(::std::format!("{}{}", #prefix, suffix))
+                }
+            }
+        }
+    } else {
+        quote!()
+    };
     Ok(quote! {
         #vis use #module::#name;
 
@@ -654,6 +678,7 @@ fn value_impl(args: TokenStream2, item: TokenStream2, is_id: bool) -> Result<Tok
             }
 
             #id
+            #fresh
         }
     })
 }
@@ -848,10 +873,19 @@ fn rejection_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     let reason_strs: Vec<_> =
         reasons.iter().map(|ident| LitStr::new(&ident.to_string(), ident.span())).collect();
     let standard = standard_derives();
+    let mut declared = item.clone();
+    declared.attrs.retain(|attr| !attr.path().is_ident("doc"));
+    for variant in &mut declared.variants {
+        variant.attrs.retain(|attr| !attr.path().is_ident("doc"));
+    }
+    let fingerprint = fingerprint(quote!(#declared));
     Ok(quote! {
         #standard
         #[serde(tag = #TAG_FIELD)]
         #item
+        impl ::oath::__private::Persisted for #name {
+            const FINGERPRINT: u64 = #fingerprint;
+        }
         impl ::oath::Rejection for #name {
             fn name(&self) -> &'static str {
                 match self { #( Self::#reasons { .. } => #reason_strs, )* }
@@ -1217,6 +1251,11 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
                 const SCHEMA: u64 = ::oath::__private::schema(&[
                     #( (#state_strs, <#states as ::oath::__private::Persisted>::FINGERPRINT), )*
                 ]);
+                const WIRE: u64 = ::oath::__private::schema(&[
+                    #( (<#commands as ::oath::__private::Named>::NAME, <#commands as ::oath::__private::Persisted>::FINGERPRINT), )*
+                    #( (<#events as ::oath::__private::Named>::NAME, <#events as ::oath::__private::Persisted>::FINGERPRINT), )*
+                    ("", <#rejection_alias as ::oath::__private::Persisted>::FINGERPRINT),
+                ]);
                 fn save(&self) -> ::oath::__private::serde_value::Value {
                     ::oath::__private::serde_value::to_value(&self.0).expect("a state is written through serde")
                 }
@@ -1356,10 +1395,12 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
         ));
     }
     let name = item.ident.clone();
-    let (command, event, rejection) = (
+    let (command, event, rejection, instance, row) = (
         format_ident!("{}Command", name),
         format_ident!("{}Event", name),
         format_ident!("{}Rejection", name),
+        format_ident!("{}Instance", name),
+        format_ident!("{}Row", name),
     );
     let vis = item.vis.clone();
     let inner_vis = vis_one_level_down(&vis);
@@ -1435,6 +1476,14 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
         format!("The rejections of every aggregate in {name}. Defined by `#[oath::context]`."),
     );
     let struct_attrs = &item.attrs;
+    let (instance_doc, row_doc) = (
+        format!("One aggregate instance of {name}, by its aggregate and id. Defined by `#[oath::context]`."),
+        format!("One row of a view of {name}, by its view and key. Defined by `#[oath::context]`."),
+    );
+    let id_types = aggregates.iter().map(|a| quote!(<#a as ::oath::Aggregate>::Id));
+    let key_types = views.iter().map(|v| quote!(<#v as ::oath::View>::Key));
+    let names_of = |list: &[Ident]| list.iter().map(|i| LitStr::new(&i.to_string(), i.span())).collect::<Vec<_>>();
+    let (aggregate_strs, view_strs) = (names_of(&aggregates), names_of(&views));
 
     Ok(quote! {
         #[doc = #command_doc]
@@ -1505,6 +1554,32 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
         #[serde(crate = "::oath::__private::serde")]
         #vis enum #rejection { #( #aggregates(#rejection_types), )* }
 
+        #[doc = #instance_doc]
+        #[derive(
+            ::core::fmt::Debug,
+            ::core::clone::Clone,
+            ::core::cmp::PartialEq,
+            ::core::cmp::Eq,
+            ::core::hash::Hash,
+            #serde::Serialize,
+            #serde::Deserialize,
+        )]
+        #[serde(crate = "::oath::__private::serde")]
+        #vis enum #instance { #( #aggregates(#id_types), )* }
+
+        #[doc = #row_doc]
+        #[derive(
+            ::core::fmt::Debug,
+            ::core::clone::Clone,
+            ::core::cmp::PartialEq,
+            ::core::cmp::Eq,
+            ::core::hash::Hash,
+            #serde::Serialize,
+            #serde::Deserialize,
+        )]
+        #[serde(crate = "::oath::__private::serde")]
+        #vis enum #row { #( #views(#key_types), )* }
+
         #vis use #module::#name;
         #( #recorded )*
 
@@ -1528,19 +1603,20 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
             #( #struct_attrs )*
             #inner_vis struct #name {
                 store: ::std::boxed::Box<dyn #store_trait>,
-                recover: bool,
+                recover: ::core::sync::atomic::AtomicBool,
             }
 
             impl #name {
                 #[doc = #new_doc]
                 pub fn new(store: impl #stores 'static) -> Self {
-                    Self { store: ::std::boxed::Box::new(store), recover: true }
+                    Self { store: ::std::boxed::Box::new(store), recover: ::core::sync::atomic::AtomicBool::new(true) }
                 }
             }
 
             #(
                 impl ::oath::__private::Holds<#views> for #name {
                     fn view_store(&self) -> &dyn ::oath::__private::DynViewStore<#views> { &*self.store }
+                    fn row_of(key: <#views as ::oath::View>::Key) -> #row where Self: ::oath::Context { #row::#views(key) }
                 }
             )*
 
@@ -1556,23 +1632,8 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                     ::core::result::Result<(::std::vec::Vec<::oath::__private::Entry>, ::oath::Position), ::oath::__private::BoxError>,
                 > {
                     ::std::boxed::Box::pin(async move {
-                        let store = &*self.store;
-                        let mut upto = <dyn #store_trait as ::oath::__private::DynStore<#first>>::dyn_head(store).await?;
-                        let mut entries = ::std::vec::Vec::new();
-                        #(
-                            let logged = <dyn #store_trait as ::oath::__private::DynStore<#aggregates>>::dyn_log(
-                                store, after, ::oath::__private::LOG_BATCH,
-                            ).await?;
-                            if logged.len() == ::oath::__private::LOG_BATCH {
-                                if let ::core::option::Option::Some(last) = logged.last() {
-                                    upto = upto.min(last.position);
-                                }
-                            }
-                            entries.extend(logged.into_iter().map(::oath::__private::Entry::of::<#aggregates>));
-                        )*
-                        entries.retain(|entry| entry.position <= upto);
-                        entries.sort_by_key(|entry| entry.position);
-                        ::core::result::Result::Ok((entries, upto))
+                        let (changes, upto) = ::oath::Context::changes(self, after).await?;
+                        ::core::result::Result::Ok((changes.into_iter().map(::oath::__private::Entry::of::<Self>).collect(), upto))
                     })
                 }
 
@@ -1588,23 +1649,30 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                 type Event = #event;
                 type Rejection = #rejection;
 
-                fn send(
-                    &mut self,
-                    command: impl ::core::convert::Into<#command>,
-                ) -> impl ::core::future::Future<
-                    Output = ::core::result::Result<::std::vec::Vec<#event>, ::oath::SendError<#rejection>>,
-                > + ::core::marker::Send {
-                    let command: #command = command.into();
-                    async move {
+                type Instance = #instance;
+                type Row = #row;
+
+                const FINGERPRINT: u64 = ::oath::__private::schema(&[
+                    #( (#aggregate_strs, <#aggregates as ::oath::__private::Persist>::SCHEMA), )*
+                    #( (#aggregate_strs, <#aggregates as ::oath::__private::Persist>::WIRE), )*
+                    #( (#view_strs, <#views as ::oath::__private::Persisted>::FINGERPRINT), )*
+                ]);
+
+                fn send_as<'a>(
+                    &'a self,
+                    command: #command,
+                    id: ::core::option::Option<&'a ::oath::CommandId>,
+                ) -> ::oath::__private::BoxFuture<'a, ::oath::__private::Sent<Self>> {
+                    ::std::boxed::Box::pin(async move {
                         // On a context's first send, and after a store failure, every saga
                         // catches up: a saga added since then starts at the end of the log, and
                         // one that missed an event, as after a crash, takes it in.
-                        let recover = self.recover;
+                        let recover = self.recover.load(::core::sync::atomic::Ordering::Relaxed);
                         if recover {
-                            #( let _ = ::oath::__private::start::<#sagas, _, _>(&*self.store, &*self).await; )*
+                            #( let _ = ::oath::__private::start::<#sagas, _, _>(&*self.store, self).await; )*
                         }
-                        let context = &*self;
-                        let events = ::oath::Context::dispatch(context, command, ::core::option::Option::None).await?;
+                        let context = self;
+                        let events = ::oath::Context::dispatch(context, command, id).await?;
                         // The events are recorded. Each round, only the views and sagas that
                         // listen for an event the round recorded take part, except that the
                         // first round sends every saga's outstanding commands. A view the store
@@ -1647,8 +1715,113 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                             }
                             fresh = next;
                         }
-                        self.recover = failed;
+                        self.recover.store(failed, ::core::sync::atomic::Ordering::Relaxed);
                         result
+                    })
+                }
+
+                // The log reads each aggregate's next events, keeps those up to the latest position
+                // every aggregate has been read to, and merges them in order. The head is read first,
+                // so no event at or before it can become readable after its aggregate was read.
+                fn changes(
+                    &self,
+                    after: ::oath::Position,
+                ) -> ::oath::__private::BoxFuture<
+                    '_,
+                    ::core::result::Result<(::std::vec::Vec<::oath::__private::Change<Self>>, ::oath::Position), ::oath::StoreError>,
+                > {
+                    ::std::boxed::Box::pin(async move {
+                        let store = &*self.store;
+                        let mut upto = <dyn #store_trait as ::oath::__private::DynStore<#first>>::dyn_head(store).await?;
+                        let mut changes = ::std::vec::Vec::new();
+                        #(
+                            let logged = <dyn #store_trait as ::oath::__private::DynStore<#aggregates>>::dyn_log(
+                                store, after, ::oath::__private::LOG_BATCH,
+                            ).await?;
+                            if logged.len() == ::oath::__private::LOG_BATCH {
+                                if let ::core::option::Option::Some(last) = logged.last() {
+                                    upto = upto.min(last.position);
+                                }
+                            }
+                            changes.extend(logged.into_iter().map(|logged| ::oath::__private::Change {
+                                position: logged.position,
+                                instance: #instance::#aggregates(logged.id),
+                                version: logged.version,
+                                event: #event::#aggregates(logged.event),
+                            }));
+                        )*
+                        changes.retain(|change| change.position <= upto);
+                        changes.sort_by_key(|change| change.position);
+                        ::core::result::Result::Ok((changes, upto))
+                    })
+                }
+
+                fn state_of<'a>(
+                    &'a self,
+                    instance: &'a #instance,
+                ) -> ::oath::__private::BoxFuture<
+                    'a,
+                    ::core::result::Result<(::oath::Version, ::core::option::Option<::oath::__private::serde_value::Value>), ::oath::StoreError>,
+                > {
+                    ::std::boxed::Box::pin(async move {
+                        match instance {
+                            #( #instance::#aggregates(id) => ::oath::__private::state_of::<#aggregates, _>(&*self.store, id).await, )*
+                        }
+                    })
+                }
+
+                fn current<'a>(
+                    &'a self,
+                    row: &'a #row,
+                ) -> ::oath::__private::BoxFuture<'a, ::core::result::Result<::oath::__private::serde_value::Value, ::oath::StoreError>> {
+                    ::std::boxed::Box::pin(async move {
+                        match *row {
+                            #( #row::#views(ref key) => ::oath::__private::current::<#views, Self>(self, key).await, )*
+                        }
+                    })
+                }
+
+                fn project_in(
+                    row: &#row,
+                    value: ::core::option::Option<&::oath::__private::serde_value::Value>,
+                    instance: &#instance,
+                    event: &#event,
+                ) -> ::core::option::Option<::oath::__private::serde_value::Value> {
+                    let _ = (&value, instance, event);
+                    match *row {
+                        #( #row::#views(ref key) => ::oath::__private::project_in::<#views, Self>(key, value, instance, event), )*
+                    }
+                }
+
+                fn target(command: &#command) -> #instance {
+                    match command {
+                        #( #command::#aggregates(command) => #instance::#aggregates(::core::clone::Clone::clone(::oath::Command::target(command))), )*
+                    }
+                }
+
+                fn decide_in(
+                    state: ::core::option::Option<&::oath::__private::serde_value::Value>,
+                    command: &#command,
+                ) -> ::core::result::Result<::std::vec::Vec<#event>, #rejection> {
+                    match command {
+                        #( #command::#aggregates(command) => ::oath::__private::decide_in::<#aggregates, _, _>(state, command, #event::#aggregates, #rejection::#aggregates), )*
+                    }
+                }
+
+                fn evolve_in(
+                    state: ::core::option::Option<&::oath::__private::serde_value::Value>,
+                    event: &#event,
+                ) -> ::core::option::Option<::oath::__private::serde_value::Value> {
+                    match event {
+                        #( #event::#aggregates(event) => ::oath::__private::evolve_in::<#aggregates>(state, event), )*
+                    }
+                }
+
+                #[allow(unreachable_patterns)]
+                fn erase(instance: #instance, event: #event) -> (::oath::__private::AnyBox, ::oath::__private::AnyBox) {
+                    match (instance, event) {
+                        #( (#instance::#aggregates(id), #event::#aggregates(event)) => ::oath::__private::erase::<#aggregates>(id, event), )*
+                        _ => ::core::panic!("an event comes with an instance of the aggregate that records it"),
                     }
                 }
 

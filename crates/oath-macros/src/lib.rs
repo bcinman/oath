@@ -1,6 +1,6 @@
 //! Attribute macros for the `oath` crate. Use them through `oath`: `#[oath::command]`,
 //! `#[oath::event]`, `#[oath::rejection]`, `#[oath::id]`, `#[oath::value]`,
-//! `#[oath::aggregate(...)]`, `#[oath::context(...)]`, and `#[oath::view(...)]`.
+//! `#[oath::state]`, `#[oath::aggregate(...)]`, `#[oath::context(...)]`, and `#[oath::view(...)]`.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
@@ -51,13 +51,20 @@ pub fn aggregate(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(aggregate_impl(args.into(), item.into()))
 }
 
+/// Declares an aggregate state struct, which a snapshot stores: derives serde, and a
+/// fingerprint that tells a snapshot written before the struct changed.
+#[proc_macro_attribute]
+pub fn state(args: TokenStream, item: TokenStream) -> TokenStream {
+    expand(state_impl(args.into(), item.into()))
+}
+
 /// Declares a bounded context on a unit struct, listing its aggregates and views.
 #[proc_macro_attribute]
 pub fn context(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(context_impl(args.into(), item.into()))
 }
 
-/// Declares a view: a struct the events listed in `on(...)` keep up to date.
+/// Declares a view: rows by `key`, which the events listed in `on(...)` keep up to date.
 #[proc_macro_attribute]
 pub fn view(args: TokenStream, item: TokenStream) -> TokenStream {
     expand(view_impl(args.into(), item.into()))
@@ -675,8 +682,8 @@ fn grouping_enum(
     let inner = match kind {
         Kind::Event => quote! {
             impl ::oath::__private::Inner for #name {
-                fn inner(&self) -> &dyn ::core::any::Any {
-                    match self { #( Self::#names(inner) => inner, )* }
+                fn into_any(self) -> ::std::boxed::Box<dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync> {
+                    match self { #( Self::#names(inner) => ::std::boxed::Box::new(inner), )* }
                 }
             }
         },
@@ -1118,6 +1125,9 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
     item.attrs = struct_attrs.iter().filter(|attr| !attr.path().is_ident("doc")).cloned().collect();
     // A final state's data is read by no generated code, only by the user's own impls.
     item.attrs.push(parse_quote!(#[allow(dead_code)]));
+    // A snapshot stores the state enum; each state struct is serde through #[oath::state].
+    item.attrs.push(parse_quote!(#[derive(::oath::__private::serde::Serialize, ::oath::__private::serde::Deserialize)]));
+    item.attrs.push(parse_quote!(#[serde(crate = "::oath::__private::serde")]));
     let lit = |ident: &Ident| LitStr::new(&ident.to_string(), ident.span());
     let state_strs: Vec<_> = states.iter().map(lit).collect();
 
@@ -1159,7 +1169,7 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
             markers.push(quote! { impl ::oath::On<#on> for #state { type To = #to; } });
             evolve_arms.push(quote! {
                 (#inner::#state(state), #event::#on(event)) =>
-                    Self(#inner::#to(<#state as ::oath::Transition<#on>>::evolve(state, event))),
+                    ::core::result::Result::Ok(Self(#inner::#to(<#state as ::oath::Transition<#on>>::evolve(state, event)))),
             });
             let (from, to) = (lit(state), lit(to));
             edges.push(quote! {
@@ -1192,6 +1202,18 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
             #item
 
             impl ::oath::__private::Sealed for #name {}
+
+            impl ::oath::__private::Persist for #name {
+                const SCHEMA: u64 = ::oath::__private::schema(&[
+                    #( (#state_strs, <#states as ::oath::__private::Persisted>::FINGERPRINT), )*
+                ]);
+                fn save(&self) -> ::oath::__private::serde_value::Value {
+                    ::oath::__private::serde_value::to_value(&self.0).expect("a state is written through serde")
+                }
+                fn restore(state: ::oath::__private::serde_value::Value) -> ::core::option::Option<Self> {
+                    state.deserialize_into::<#inner>().ok().map(Self)
+                }
+            }
 
             impl ::core::default::Default for #name {
                 fn default() -> Self {
@@ -1228,15 +1250,14 @@ fn aggregate_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2
                 }
 
                 #[allow(unreachable_patterns)]
-                fn evolve(self, event: &#event) -> Self {
+                fn evolve(self, event: &#event) -> ::core::result::Result<Self, ::oath::Unreplayable> {
                     let from = ::oath::Aggregate::state(&self);
                     match (self.0, event) {
                         #( #evolve_arms )*
-                        (_, event) => ::core::panic!(
-                            "event {} has no transition from state {}; the history and the model disagree",
-                            ::oath::Event::name(event),
-                            from,
-                        ),
+                        (_, event) => ::core::result::Result::Err(::oath::Unreplayable {
+                            state: from,
+                            event: ::oath::Event::name(event),
+                        }),
                     }
                 }
             }
@@ -1336,24 +1357,26 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
     let event_types = aggregates.iter().map(|a| quote!(<#a as ::oath::Aggregate>::Event));
     let rejection_types = aggregates.iter().map(|a| quote!(<#a as ::oath::Aggregate>::Rejection));
     let store_trait = format_ident!("__{}Store", name);
-    let stores = quote!( #( ::oath::Store<#aggregates> + )* ::core::marker::Send + ::core::marker::Sync );
-    let new_doc = format!(
-        "A {name} that keeps the events of its aggregates in `store`, which implements \
-         [`Store`](::oath::Store) for each of them. Its views start empty."
+    let dyn_stores = quote!(
+        #( ::oath::__private::DynStore<#aggregates> + )*
+        #( ::oath::__private::DynViewStore<#views> + )*
+        ::core::marker::Send + ::core::marker::Sync
     );
-    let view_indices: Vec<_> = (0..views.len()).map(syn::Index::from).collect();
-    // Each command goes to its aggregate, and each event it records to every view, which
-    // keeps the events it subscribes to.
+    let stores = quote!( #( ::oath::Store<#aggregates> + )* #( ::oath::ViewStore<#views> + )* );
+    let new_doc = format!(
+        "A {name} that keeps the events and snapshots of its aggregates, and the rows of its views, \
+         in `store`, which implements [`Store`](::oath::Store) for each aggregate and \
+         [`ViewStore`](::oath::ViewStore) for each view."
+    );
+    let first = &aggregates[0];
+    // Each command goes to its aggregate.
     let send_arms = aggregates.iter().map(|aggregate| {
         quote! {
             #command::#aggregate(command) => {
-                let events = ::oath::__private::send::<#aggregate, _>(&mut *self.store, &command)
-                    .map_err(#rejection::#aggregate)?;
-                let target = ::oath::Command::target(&command);
-                for event in &events {
-                    #( ::oath::__private::route::<#aggregate, _>(&mut self.views.#view_indices, target, event); )*
-                }
-                ::core::result::Result::Ok(events.into_iter().map(#event::#aggregate).collect())
+                ::oath::__private::send::<#aggregate, _>(&*self.store, &command)
+                    .await
+                    .map(|events| events.into_iter().map(#event::#aggregate).collect::<::std::vec::Vec<_>>())
+                    .map_err(|error| ::oath::__private::rejected_as(error, #rejection::#aggregate))
             }
         }
     });
@@ -1466,37 +1489,66 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
         #vis use #module::#name;
         #( #recorded )*
 
-        // The context is a struct with private fields holding its store and its views, defined
-        // in a private module, so no code but `send` can append events or change a view.
+        // The context is a struct with a private field holding its store, defined in a private
+        // module, so no code but `send` can append events.
         #[doc(hidden)]
         #[allow(non_snake_case)]
         mod #module {
             use super::*;
 
-            trait #store_trait: #stores {}
-            impl<S: #stores> #store_trait for S {}
+            trait #store_trait: #dyn_stores {}
+            impl<S: #dyn_stores> #store_trait for S {}
 
             #( #struct_attrs )*
             #inner_vis struct #name {
                 store: ::std::boxed::Box<dyn #store_trait>,
-                views: ( #( #views, )* ),
             }
 
             impl #name {
                 #[doc = #new_doc]
-                pub fn new(store: impl #stores + 'static) -> Self {
-                    Self {
-                        store: ::std::boxed::Box::new(store),
-                        views: ( #( <#views as ::core::default::Default>::default(), )* ),
-                    }
+                pub fn new(store: impl #stores 'static) -> Self {
+                    Self { store: ::std::boxed::Box::new(store) }
                 }
             }
 
             #(
                 impl ::oath::__private::Holds<#views> for #name {
-                    fn held(&self) -> &#views { &self.views.#view_indices }
+                    fn view_store(&self) -> &dyn ::oath::__private::DynViewStore<#views> { &*self.store }
                 }
             )*
+
+            // The log reads each aggregate's next events, keeps those up to the latest position
+            // every aggregate has been read to, and merges them in order. The head is read first,
+            // so no event at or before it can become readable after its aggregate was read.
+            impl ::oath::__private::Log for #name {
+                fn log<'a>(
+                    &'a self,
+                    after: ::oath::Position,
+                ) -> ::oath::__private::BoxFuture<
+                    'a,
+                    ::core::result::Result<(::std::vec::Vec<::oath::__private::Entry>, ::oath::Position), ::oath::__private::BoxError>,
+                > {
+                    ::std::boxed::Box::pin(async move {
+                        let store = &*self.store;
+                        let mut upto = <dyn #store_trait as ::oath::__private::DynStore<#first>>::dyn_head(store).await?;
+                        let mut entries = ::std::vec::Vec::new();
+                        #(
+                            let logged = <dyn #store_trait as ::oath::__private::DynStore<#aggregates>>::dyn_log(
+                                store, after, ::oath::__private::LOG_BATCH,
+                            ).await?;
+                            if logged.len() == ::oath::__private::LOG_BATCH {
+                                if let ::core::option::Option::Some(last) = logged.last() {
+                                    upto = upto.min(last.position);
+                                }
+                            }
+                            entries.extend(logged.into_iter().map(::oath::__private::Entry::of::<#aggregates>));
+                        )*
+                        entries.retain(|entry| entry.position <= upto);
+                        entries.sort_by_key(|entry| entry.position);
+                        ::core::result::Result::Ok((entries, upto))
+                    })
+                }
+            }
 
             impl ::oath::__private::Sealed for #name {}
 
@@ -1508,8 +1560,17 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
                 fn send(
                     &mut self,
                     command: impl ::core::convert::Into<#command>,
-                ) -> ::core::result::Result<::std::vec::Vec<#event>, #rejection> {
-                    match command.into() { #( #send_arms )* }
+                ) -> impl ::core::future::Future<
+                    Output = ::core::result::Result<::std::vec::Vec<#event>, ::oath::SendError<#rejection>>,
+                > + ::core::marker::Send {
+                    let command: #command = command.into();
+                    async move {
+                        let events = match command { #( #send_arms )* }?;
+                        // The events are recorded; a view the store fails to update catches up
+                        // the next time it is read or updated.
+                        #( let _ = ::oath::__private::catch_up::<#views, _, _>(&*self.store, &*self).await; )*
+                        ::core::result::Result::Ok(events)
+                    }
                 }
             }
 
@@ -1525,14 +1586,25 @@ fn context_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> 
 // ---------------------------------------------------------------------------------------------
 // #[oath::view]
 
-/// The `on(Event, ...)` of `#[oath::view]`.
-struct ViewArgs(Vec<Ident>);
+/// The `key = Type, on(Event, ...)` of `#[oath::view]`.
+struct ViewArgs {
+    key: Type,
+    events: Vec<Ident>,
+}
 
 impl Parse for ViewArgs {
     fn parse(input: ParseStream) -> Result<Self> {
-        let key: Ident = input.parse()?;
-        if key != "on" {
-            return Err(Error::new_spanned(key, "expected `on(Event, ...)`"));
+        let expected = "expected `key = Type, on(Event, ...)`";
+        let first: Ident = input.parse().map_err(|error| Error::new(error.span(), expected))?;
+        if first != "key" {
+            return Err(Error::new_spanned(first, format!("{expected}; a view with one row has `key = ()`")));
+        }
+        input.parse::<Token![=]>()?;
+        let key: Type = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let on: Ident = input.parse()?;
+        if on != "on" {
+            return Err(Error::new_spanned(on, expected));
         }
         let content;
         parenthesized!(content in input);
@@ -1544,50 +1616,118 @@ impl Parse for ViewArgs {
             events.push(event);
         }
         if events.is_empty() {
-            return Err(Error::new_spanned(key, "list at least one event in `on(...)`"));
+            return Err(Error::new_spanned(on, "list at least one event in `on(...)`"));
         }
         if !input.is_empty() {
             input.parse::<Token![,]>()?;
         }
         if !input.is_empty() {
-            return Err(input.error("expected only `on(Event, ...)`"));
+            return Err(input.error(expected));
         }
-        Ok(ViewArgs(events))
+        Ok(ViewArgs { key, events })
     }
 }
 
 fn view_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
     if args.is_empty() {
-        return Err(Error::new(Span::call_site(), "#[oath::view] needs `on(Event, ...)`"));
+        return Err(Error::new(Span::call_site(), "#[oath::view] needs `key = Type, on(Event, ...)`"));
     }
-    let ViewArgs(events) = syn::parse2(args)?;
+    let ViewArgs { key, events } = syn::parse2(args)?;
     let item: ItemStruct = syn::parse2(item)
         .map_err(|error| Error::new(error.span(), "#[oath::view] goes on a struct"))?;
     if !item.generics.params.is_empty() {
         return Err(Error::new_spanned(&item.generics, "#[oath::view] does not support generics"));
     }
     let name = &item.ident;
+    // A saved row was projected under the view's struct, key, and events; when any of them
+    // changes, the view is rebuilt.
+    let declared = without_docs(&item);
+    let fingerprint = fingerprint(quote!(#key #( #events )* #declared));
     // Each bound carries its event's span, so an event the context's aggregates don't record
     // is reported at that event in `on(...)`.
     let recorded = events.iter().map(|event| {
         quote_spanned! {event.span()=> #event: ::oath::__private::EventIn<C>, }
     });
     Ok(quote! {
+        #[derive(::oath::__private::serde::Serialize, ::oath::__private::serde::Deserialize)]
+        #[serde(crate = "::oath::__private::serde")]
         #item
         impl ::oath::__private::Sealed for #name {}
+        impl ::oath::__private::Persisted for #name {
+            const FINGERPRINT: u64 = #fingerprint;
+        }
         impl ::oath::View for #name {
-            fn route(&mut self, id: &dyn ::core::any::Any, event: &dyn ::core::any::Any) {
+            type Key = #key;
+            fn key_of(
+                id: &dyn ::core::any::Any,
+                event: &dyn ::core::any::Any,
+            ) -> ::core::option::Option<#key> {
                 #(
                     if let ::core::option::Option::Some(event) = event.downcast_ref::<#events>() {
                         let id = id
                             .downcast_ref::<<<#events as ::oath::BelongsToAggregate>::Aggregate as ::oath::Aggregate>::Id>()
                             .expect("an event comes with the id of the aggregate that records it");
-                        return <Self as ::oath::Project<#events>>::project(self, id, event);
+                        return ::core::option::Option::Some(<Self as ::oath::Project<#events>>::key(id, event));
+                    }
+                )*
+                ::core::option::Option::None
+            }
+            fn apply(&mut self, event: &dyn ::core::any::Any) {
+                #(
+                    if let ::core::option::Option::Some(event) = event.downcast_ref::<#events>() {
+                        return <Self as ::oath::Project<#events>>::project(self, event);
                     }
                 )*
             }
         }
         #( impl ::oath::Subscribes<#events> for #name {} )*
         impl<C> ::oath::__private::RecordedIn<C> for #name where #( #recorded )* {}
+    })
+}
+
+/// FNV-1a over the tokens of a declaration, without its doc comments.
+fn fingerprint(tokens: TokenStream2) -> u64 {
+    let mut fingerprint: u64 = 0xcbf29ce484222325;
+    for byte in tokens.to_string().bytes() {
+        fingerprint ^= u64::from(byte);
+        fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+    }
+    fingerprint
+}
+
+/// `item` without its doc comments, so editing docs keeps its fingerprint.
+fn without_docs(item: &ItemStruct) -> ItemStruct {
+    let mut declared = item.clone();
+    declared.attrs.retain(|attr| !attr.path().is_ident("doc"));
+    for field in declared.fields.iter_mut() {
+        field.attrs.retain(|attr| !attr.path().is_ident("doc"));
+    }
+    declared
+}
+
+// ---------------------------------------------------------------------------------------------
+// #[oath::state]
+
+fn state_impl(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
+    if !args.is_empty() {
+        return Err(Error::new_spanned(args, "#[oath::state] takes no arguments"));
+    }
+    let item: ItemStruct = syn::parse2(item)
+        .map_err(|error| Error::new(error.span(), "#[oath::state] goes on a state struct"))?;
+    if !item.generics.params.is_empty() {
+        return Err(Error::new_spanned(&item.generics, "#[oath::state] does not support generics"));
+    }
+    // The fingerprint covers the struct's declaration except its docs, so a snapshot written
+    // before a field changed is not read back as the new struct.
+    let declared = without_docs(&item);
+    let fingerprint = fingerprint(quote!(#declared));
+    let name = &item.ident;
+    Ok(quote! {
+        #[derive(::oath::__private::serde::Serialize, ::oath::__private::serde::Deserialize)]
+        #[serde(crate = "::oath::__private::serde")]
+        #item
+        impl ::oath::__private::Persisted for #name {
+            const FINGERPRINT: u64 = #fingerprint;
+        }
     })
 }

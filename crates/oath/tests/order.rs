@@ -1,4 +1,4 @@
-use oath::{Aggregate, Command, Decision, Edge, Event, Handle, NotAllowed, Rejection, Transition};
+use oath::{Aggregate, Command, Decision, Edge, Event, Handle, NotAllowed, Rejection, Transition, Unreplayable};
 
 #[oath::id(prefix = "ord_", len = 5..=40, chars = "a-z0-9_")] pub struct OrderId(String);
 
@@ -14,10 +14,10 @@ use oath::{Aggregate, Command, Decision, Edge, Event, Handle, NotAllowed, Reject
 
 #[oath::rejection] pub enum OrderRejection { WrongAmount { expected: u64 }, AlreadyFinal }
 
-pub struct Draft;
-pub struct Placed { total: u64 }
-pub struct Paid { amount: u64 }
-pub struct Cancelled;
+#[oath::state] pub struct Draft;
+#[oath::state] pub struct Placed { total: u64 }
+#[oath::state] pub struct Paid { amount: u64 }
+#[oath::state] pub struct Cancelled;
 
 #[oath::aggregate(id = OrderId, rejection = OrderRejection)]
 pub enum Order {
@@ -78,7 +78,7 @@ fn o1() -> OrderId { OrderId::new("ord_1").unwrap() }
 /// Decides `command` against `order` and applies the resulting events.
 fn run(order: Order, command: impl Into<OrderCommand>) -> (Order, Vec<OrderEvent>) {
     let events = order.decide(&command.into()).unwrap();
-    (events.iter().fold(order, Order::evolve), events)
+    (events.iter().try_fold(order, Order::evolve).unwrap(), events)
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn a_paid_order_cancels_through_a_refund_and_replays_to_the_same_state() {
     history.extend(events);
 
     assert_eq!(order.state(), "Cancelled");
-    assert_eq!(Order::replay(&history).state(), "Cancelled");
+    assert_eq!(Order::replay(&history).unwrap().state(), "Cancelled");
     let names: Vec<_> = history.iter().map(Event::name).collect();
     assert_eq!(names, ["OrderPlaced", "OrderPaid", "OrderRefunded", "OrderCancelled"]);
 }
@@ -162,7 +162,7 @@ fn commands_events_and_rejections_go_over_the_wire_as_tagged_structs() {
     let received: Vec<OrderEvent> = from_str(&wire).unwrap();
     assert!(from_str::<OrderEvent>(r#"{"kind":"RefundIssued","amount":40}"#).is_err());
     assert_eq!(received, history);
-    assert_eq!(Order::replay(&received).state(), "Cancelled");
+    assert_eq!(Order::replay(&received).unwrap().state(), "Cancelled");
 
     let (placed, _) = run(Order::default(), PlaceOrder { order: o1(), total: 40 });
     let rejection = placed.decide(&PlaceOrder { order: o1(), total: 1 }.into()).unwrap_err();
@@ -194,7 +194,10 @@ fn transitions_list_every_declared_edge_in_order() {
 }
 
 #[test]
-#[should_panic(expected = "event OrderPaid has no transition from state Draft")]
-fn replaying_an_event_with_no_transition_panics() {
-    Order::replay(&[OrderPaid { amount: 1 }.into()]);
+fn replaying_an_event_with_no_transition_is_unreplayable() {
+    let placed: OrderEvent = OrderPlaced { total: 40 }.into();
+    let replayed = Order::replay(&[placed, OrderPaid { amount: 40 }.into(), OrderPlaced { total: 1 }.into()]);
+    let Err(error) = replayed else { panic!("replayed an event Paid has no transition for") };
+    assert_eq!(error, Unreplayable { state: "Paid", event: "OrderPlaced" });
+    assert_eq!(error.to_string(), "event OrderPlaced has no transition from state Paid; the history and the model disagree");
 }

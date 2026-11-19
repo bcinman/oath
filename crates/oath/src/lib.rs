@@ -50,7 +50,8 @@
 //! `#[state(...)]` attribute on each state is the transition table, and `#[oath::aggregate]`
 //! turns it into an [`Aggregate`] implementation. A command a state does not accept is
 //! rejected with [`NotAllowed`]. The `#[initial]` state means no event has happened yet, so
-//! it holds no data: write it as `struct Draft;`.
+//! it holds no data: write it as `struct Draft;`. Mark every state struct `#[oath::state]`,
+//! which lets a snapshot store it.
 //!
 //! The aggregate itself is opaque: `#[oath::aggregate]` turns the enum into a struct whose
 //! state no code can build or change except [`Aggregate::evolve`], starting from the
@@ -70,9 +71,9 @@
 //!
 //! #[oath::rejection] pub enum OrderRejection { WrongAmount { expected: u64 } }
 //!
-//! pub struct Draft;
-//! pub struct Placed { total: u64 }
-//! pub struct Paid;
+//! #[oath::state] pub struct Draft;
+//! #[oath::state] pub struct Placed { total: u64 }
+//! #[oath::state] pub struct Paid;
 //!
 //! #[oath::aggregate(id = OrderId, rejection = OrderRejection)]
 //! pub enum Order {
@@ -106,7 +107,7 @@
 //! let place: OrderCommand = PlaceOrder { order: id(), total: 40 }.into();
 //! assert_eq!(place.target(), &id());
 //! let events = Order::default().decide(&place).unwrap();
-//! let order = Order::replay(&events);
+//! let order = Order::replay(&events).unwrap();
 //! assert_eq!(order.state(), "Placed");
 //! assert_eq!(
 //!     order.decide(&place),
@@ -117,7 +118,7 @@
 //! # }
 //! ```
 
-pub use oath_macros::{aggregate, command, context, event, id, rejection, value, view};
+pub use oath_macros::{aggregate, command, context, event, id, rejection, state, value, view};
 
 /// A request to perform one business action, named in the imperative.
 ///
@@ -163,7 +164,15 @@ pub trait Rejection: From<NotAllowed> {
 /// Implemented by `#[oath::id]`, which derives `Debug`, `Clone`, `PartialEq`, `Eq`, `Hash`, and
 /// serde. On the wire an id is its inner value: `OrderId::new("ord_1")?` is `"ord_1"`.
 pub trait Id:
-    Clone + Eq + core::hash::Hash + core::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned
+    Clone
+    + Eq
+    + core::hash::Hash
+    + core::fmt::Debug
+    + Send
+    + Sync
+    + 'static
+    + serde::Serialize
+    + serde::de::DeserializeOwned
 {
 }
 
@@ -171,15 +180,21 @@ pub trait Id:
 ///
 /// Implemented only by `#[oath::aggregate]`. Its `Default` is the `#[initial]` state, which
 /// holds no data.
-pub trait Aggregate: Default + __private::Sealed {
+pub trait Aggregate: Default + Send + Sync + 'static + __private::Sealed + __private::Persist {
     /// What identifies one instance of this aggregate.
     type Id: Id;
     /// The enum of commands this aggregate decides. Each one targets an aggregate by its id.
-    type Command: Command<Id = Self::Id>;
+    type Command: Command<Id = Self::Id> + Send + Sync + 'static;
     /// The enum of events this aggregate records.
-    type Event: Event;
+    type Event: Event
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + serde::Serialize
+        + serde::de::DeserializeOwned;
     /// The enum of reasons this aggregate rejects a command for.
-    type Rejection: Rejection;
+    type Rejection: Rejection + Send + 'static;
 
     /// Every `(from, event, to)` transition the aggregate declares.
     const TRANSITIONS: &'static [Edge];
@@ -190,22 +205,40 @@ pub trait Aggregate: Default + __private::Sealed {
     /// Pure: the current state and a command give the events to record, or a rejection.
     fn decide(&self, command: &Self::Command) -> Result<Vec<Self::Event>, Self::Rejection>;
 
-    /// Pure and infallible: the state after `event`.
-    ///
-    /// # Panics
-    ///
-    /// When the current state declares no transition for `event`, which means the history
-    /// and the model disagree.
-    fn evolve(self, event: &Self::Event) -> Self;
+    /// Pure: the state after `event`, or [`Unreplayable`] when the current state declares no
+    /// transition for it, which means the history and the model disagree.
+    fn evolve(self, event: &Self::Event) -> Result<Self, Unreplayable>;
 
     /// The state after every event in `events`, starting from the initial state.
-    fn replay<'a>(events: impl IntoIterator<Item = &'a Self::Event>) -> Self
+    fn replay<'a>(events: impl IntoIterator<Item = &'a Self::Event>) -> Result<Self, Unreplayable>
     where
         Self::Event: 'a,
     {
-        events.into_iter().fold(Self::default(), Self::evolve)
+        events.into_iter().try_fold(Self::default(), Self::evolve)
     }
 }
+
+/// A history the model can't apply: in state `state`, the aggregate declares no transition
+/// for event `event`. It means the stored events and the code disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Unreplayable {
+    /// The state the aggregate was in.
+    pub state: &'static str,
+    /// The event it has no transition for.
+    pub event: &'static str,
+}
+
+impl core::fmt::Display for Unreplayable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "event {} has no transition from state {}; the history and the model disagree",
+            self.event, self.state
+        )
+    }
+}
+
+impl std::error::Error for Unreplayable {}
 
 /// A bounded context: the aggregates of one domain, and the one way the outside world reaches
 /// them.
@@ -234,7 +267,7 @@ pub trait Aggregate: Default + __private::Sealed {
 /// aggregates in one context may have a command with the same name. Events and rejections go
 /// under their aggregate's name, such as `{"Order":{"kind":"OrderPlaced","total":40}}`, since
 /// every aggregate has a `NotAllowed` rejection.
-pub trait Context: __private::Sealed {
+pub trait Context: Send + Sync + __private::Sealed + __private::Log {
     /// The enum of every command the context's aggregates decide.
     type Command;
     /// The enum of every event the context's aggregates record.
@@ -242,38 +275,112 @@ pub trait Context: __private::Sealed {
     /// The enum of every reason the context's aggregates reject a command for.
     type Rejection;
 
-    /// Routes `command` to the aggregate instance it targets: replays that instance's events
-    /// from the store, lets it decide, and appends the events it records, which are returned.
-    /// A rejection appends nothing.
+    /// Routes `command` to the aggregate instance it targets and records what it decides.
+    ///
+    /// It loads the instance's snapshot and any events after it, lets the instance decide,
+    /// and appends the events with a snapshot of the new state, only if no other writer has
+    /// appended to the instance since it loaded. When another writer has, it loads and decides
+    /// again, up to three times in all, before returning [`SendError::Conflict`]. A rejection
+    /// appends nothing. On success it brings the context's views up to date and returns the
+    /// events. The events are recorded even when the store fails while updating a view; the
+    /// view catches up the next time it is read or updated.
     ///
     /// Takes a command struct, an aggregate's command enum, or the context's own command enum,
     /// such as one read from the wire. A command of an aggregate outside this context doesn't
     /// compile.
-    fn send(&mut self, command: impl Into<Self::Command>) -> Result<Vec<Self::Event>, Self::Rejection>;
+    fn send(
+        &mut self,
+        command: impl Into<Self::Command>,
+    ) -> impl Future<Output = Result<Vec<Self::Event>, SendError<Self::Rejection>>> + Send;
 
-    /// The context's view `V`, holding every event `send` recorded since the context was built.
-    /// A view the context doesn't list in `views = [...]` doesn't compile.
-    fn view<V: View>(&self) -> &V
+    /// The row `key` of view `V`, after the view has taken in every event in the store's log.
+    /// A row no event has touched yet is the view's `Default`. A view the context doesn't list
+    /// in `views = [...]` doesn't compile.
+    fn view<V: View>(&self, key: &V::Key) -> impl Future<Output = Result<V, StoreError>> + Send
     where
         Self: __private::Holds<V>,
     {
-        __private::Holds::held(self)
+        async move {
+            let views = __private::Holds::<V>::view_store(self);
+            __private::catch_up::<V, _, _>(views, self).await?;
+            let row = views.dyn_row(key).await?;
+            Ok(row.and_then(|row| row.restore()).unwrap_or_default())
+        }
     }
 }
 
-/// A read model the events of a context keep up to date. Implemented only by `#[oath::view]`
-/// on a struct with `Default`, such as `#[oath::view(on(OrderPlaced, OrderPaid))] #[derive(Default)]
-/// pub struct Revenue { placed: u64 }`, and added to a context in its `views = [...]`.
+/// A failure of a store, such as a lost connection.
+pub type StoreError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Why [`Context::send`] recorded nothing.
+#[derive(Debug)]
+pub enum SendError<R> {
+    /// The aggregate refused the command: a normal, typed outcome.
+    Rejected(R),
+    /// Other writers appended to the instance each time it was decided, three times in all.
+    Conflict,
+    /// The store failed.
+    Store(StoreError),
+    /// The instance's stored history can't be applied by the current model.
+    Unreplayable(Unreplayable),
+}
+
+impl<R: core::fmt::Debug> core::fmt::Display for SendError<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SendError::Rejected(rejection) => write!(f, "the command was rejected: {rejection:?}"),
+            SendError::Conflict => f.write_str("other writers kept appending to the instance"),
+            SendError::Store(error) => write!(f, "the store failed: {error}"),
+            SendError::Unreplayable(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<R: core::fmt::Debug> std::error::Error for SendError<R> {}
+
+/// A read model the events of a context keep up to date, as rows by key. Implemented only by
+/// `#[oath::view]` on a struct with `Default`, which is one row:
 ///
-/// The view implements [`Project`] for each event in its `on(...)`, and the context passes it
-/// each of those events after `send` records it. Every event a view lists must be recorded by
-/// an aggregate in the context that lists the view, which the compiler checks.
+/// ```text
+/// #[oath::view(key = AccountId, on(AccountOpened, Deposited))]
+/// #[derive(Default)]
+/// pub struct Balance { pub amount: u64 }
+/// ```
 ///
-/// A context holds its views in memory, and they start empty: a context built on a store
-/// that already holds events doesn't pass them to its views.
-pub trait View: Default + 'static + __private::Sealed {
+/// The view implements [`Project`] for each event in its `on(...)`: `key` names the row an
+/// event updates, and `project` updates it. A view with one row, such as a total, has
+/// `key = ()`. Every event a view lists must be recorded by an aggregate in the context that
+/// lists the view in its `views = [...]`, which the compiler checks.
+///
+/// The rows live in the context's [`ViewStore`], never all in memory. The view takes in the
+/// store's log in order, from the position it last saved: `send` brings it up to date after
+/// recording events, and so does reading a row with [`Context::view`]. A view whose struct,
+/// key, or events changed since its rows were saved is rebuilt from the start of the log.
+pub trait View:
+    Default
+    + Send
+    + Sync
+    + 'static
+    + serde::Serialize
+    + serde::de::DeserializeOwned
+    + __private::Sealed
+    + __private::Persisted
+{
+    /// What names one row, such as the account an event is about.
+    type Key: Clone
+        + Eq
+        + core::hash::Hash
+        + core::fmt::Debug
+        + Send
+        + Sync
+        + 'static
+        + serde::Serialize
+        + serde::de::DeserializeOwned;
+
     #[doc(hidden)]
-    fn route(&mut self, id: &dyn core::any::Any, event: &dyn core::any::Any);
+    fn key_of(id: &dyn core::any::Any, event: &dyn core::any::Any) -> Option<Self::Key>;
+    #[doc(hidden)]
+    fn apply(&mut self, event: &dyn core::any::Any);
 }
 
 /// Marks that a view lists event `E` in its `on(...)`. Implemented only by `#[oath::view]`.
@@ -291,8 +398,10 @@ pub trait Subscribes<E>: View {}
     note = "implement Project<{E}> for {Self}, or remove `{E}` from its #[oath::view(on(...))]"
 )]
 pub trait Project<E: BelongsToAggregate>: Subscribes<E> {
-    /// Updates the view with `event`, which the aggregate instance `id` recorded.
-    fn project(&mut self, id: &<E::Aggregate as Aggregate>::Id, event: &E);
+    /// The row `event` updates, which the aggregate instance `id` recorded.
+    fn key(id: &<E::Aggregate as Aggregate>::Id, event: &E) -> <Self as View>::Key;
+    /// Updates the row with `event`.
+    fn project(&mut self, event: &E);
 }
 
 /// The one context an aggregate belongs to. Implemented by `#[oath::context]` for every
@@ -311,47 +420,397 @@ pub trait BelongsToContext: Aggregate {
     type Context: Context;
 }
 
-/// Where a context keeps the events of aggregate `A`, by instance id. The events are the
-/// only record of an instance: its state is replayed from them.
-pub trait Store<A: Aggregate> {
-    /// Every event recorded for instance `id`, oldest first; empty when it has none.
-    fn load(&self, id: &A::Id) -> Vec<A::Event>;
-    /// Records `events` after the ones already recorded for instance `id`.
-    fn append(&mut self, id: &A::Id, events: &[A::Event]);
+/// Where an event sits in a store's log: every event recorded for any aggregate gets the next
+/// position. A log with no events is at `Position(0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Position(pub u64);
+
+/// How many events an aggregate instance has recorded. An instance with no events is at
+/// `Version(0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Version(pub u64);
+
+/// Where a context keeps the events of aggregate `A`, and a snapshot of each instance's
+/// current state, by instance id. Implement it for a database; [`MemoryStore`] keeps them in
+/// memory.
+///
+/// The events are the record of an instance; the snapshot saves replaying them. A context
+/// writes a snapshot with every append, so loading an instance reads its snapshot and, at
+/// most, the few events after it.
+///
+/// The store also keeps one log of every event it records, for every aggregate: each event
+/// gets the next [`Position`], and an event becomes readable only after every event before it.
+/// Views take in events through it, in the order they happened.
+pub trait Store<A: Aggregate>: Send + Sync + 'static {
+    /// What a failure of the store is, such as a lost connection.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// The latest snapshot of instance `id`, and every event recorded after it, oldest first.
+    /// With no snapshot, every event of the instance; with no events either, nothing.
+    fn load(&self, id: &A::Id) -> impl Future<Output = Result<Loaded<A>, Self::Error>> + Send;
+
+    /// Every event of instance `id` after its first `after` events, oldest first. A context
+    /// calls it when a snapshot was written by code whose states have since changed.
+    fn events(
+        &self,
+        id: &A::Id,
+        after: Version,
+    ) -> impl Future<Output = Result<Vec<A::Event>, Self::Error>> + Send;
+
+    /// In one transaction, records the events of `decided` after the ones already recorded for
+    /// its instance and replaces the instance's snapshot with its snapshot, but only when the
+    /// instance is still at version [`Decided::expected`], which is how many events it had when
+    /// it was loaded. Otherwise records nothing and returns [`AppendError::Conflict`].
+    ///
+    /// Only a context builds a [`Decided`], from what an aggregate decided, so no code can
+    /// record events that skipped `decide`.
+    ///
+    /// Each event recorded gets the next position in the store's log, shared by every aggregate
+    /// in the store.
+    fn append(&self, decided: &Decided<A>) -> impl Future<Output = Result<(), AppendError<Self::Error>>> + Send;
+
+    /// The position of the latest event in the store's log, of any aggregate; `Position(0)`
+    /// when it has none.
+    fn head(&self) -> impl Future<Output = Result<Position, Self::Error>> + Send;
+
+    /// The first `limit` events of aggregate `A` in the store's log after position `after`,
+    /// in order.
+    fn log(&self, after: Position, limit: usize) -> impl Future<Output = Result<Vec<Logged<A>>, Self::Error>> + Send;
 }
 
-/// A [`Store`] that keeps every aggregate's events in memory, for tests and prototypes. Its
-/// `Default` holds no events.
+/// One event of aggregate `A` in a store's log.
+pub struct Logged<A: Aggregate> {
+    /// The event's position in the log.
+    pub position: Position,
+    /// The instance that recorded it.
+    pub id: A::Id,
+    /// The event.
+    pub event: A::Event,
+}
+
+/// Where a context keeps the rows of view `V`, by key, and the log position the rows include.
+/// Implement it for a database; [`MemoryStore`] keeps them in memory.
+pub trait ViewStore<V: View>: Send + Sync + 'static {
+    /// What a failure of the store is, such as a lost connection.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// The view's latest checkpoint, if it has saved one.
+    fn checkpoint(&self) -> impl Future<Output = Result<Option<Checkpoint<V>>, Self::Error>> + Send;
+
+    /// The row `key` of the view, if it has saved one.
+    fn row(&self, key: &V::Key) -> impl Future<Output = Result<Option<Row<V>>, Self::Error>> + Send;
+
+    /// In one transaction, saves the rows of `projected` and replaces the view's checkpoint with
+    /// its checkpoint, but only when the saved checkpoint is still at position
+    /// [`Projected::expected`] (`Position(0)` for none). Otherwise saves nothing and returns
+    /// [`AppendError::Conflict`]. Only a context builds a [`Projected`].
+    fn save(&self, projected: &Projected<V>) -> impl Future<Output = Result<(), AppendError<Self::Error>>> + Send;
+}
+
+/// How far view `V` has taken in the store's log. A store keeps it through serde.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct Checkpoint<V> {
+    schema: u64,
+    position: Position,
+    #[serde(skip)]
+    view: core::marker::PhantomData<fn() -> V>,
+}
+
+impl<V> Checkpoint<V> {
+    /// The position of the last event in the log the view's rows include.
+    pub fn position(&self) -> Position {
+        self.position
+    }
+}
+
+/// One row of view `V`. A store keeps it through serde.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct Row<V> {
+    schema: u64,
+    state: serde_value::Value,
+    #[serde(skip)]
+    view: core::marker::PhantomData<fn() -> V>,
+}
+
+impl<V: View> Row<V> {
+    fn restore(self) -> Option<V> {
+        (self.schema == V::FINGERPRINT).then(|| self.state.deserialize_into().ok()).flatten()
+    }
+}
+
+/// The rows a view updated from the log, and how far it got, for [`ViewStore::save`]. Only a
+/// context builds one; a store reads it.
+pub struct Projected<V: View> {
+    expected: Position,
+    checkpoint: Checkpoint<V>,
+    rows: Vec<(V::Key, Row<V>)>,
+}
+
+impl<V: View> Projected<V> {
+    /// The position of the checkpoint the view loaded; `Position(0)` for none.
+    pub fn expected(&self) -> Position {
+        self.expected
+    }
+    /// The view's new checkpoint.
+    pub fn checkpoint(&self) -> &Checkpoint<V> {
+        &self.checkpoint
+    }
+    /// The rows that changed, by key.
+    pub fn rows(&self) -> &[(V::Key, Row<V>)] {
+        &self.rows
+    }
+}
+
+/// What an aggregate instance decided, for [`Store::append`] to record: its new events and a
+/// snapshot of the state after them. Only a context builds one, in `send`; a store reads it.
+pub struct Decided<A: Aggregate> {
+    id: A::Id,
+    expected: Version,
+    events: Vec<A::Event>,
+    snapshot: Snapshot<A>,
+}
+
+impl<A: Aggregate> Decided<A> {
+    /// The instance that decided.
+    pub fn id(&self) -> &A::Id {
+        &self.id
+    }
+    /// How many events the instance had when it was loaded.
+    pub fn expected(&self) -> Version {
+        self.expected
+    }
+    /// The events to record, oldest first.
+    pub fn events(&self) -> &[A::Event] {
+        &self.events
+    }
+    /// The instance's state after the events, which replaces its snapshot.
+    pub fn snapshot(&self) -> &Snapshot<A> {
+        &self.snapshot
+    }
+}
+
+/// What [`Store::load`] returns for one instance.
+pub struct Loaded<A: Aggregate> {
+    /// The instance's latest snapshot, if it has one.
+    pub snapshot: Option<Snapshot<A>>,
+    /// The events recorded after the snapshot, or every event when there is no snapshot.
+    pub events: Vec<A::Event>,
+}
+
+/// Why [`Store::append`] recorded nothing.
+#[derive(Debug)]
+pub enum AppendError<E> {
+    /// Another writer appended to the instance after it was loaded.
+    Conflict,
+    /// The store failed.
+    Store(E),
+}
+
+/// The state of one aggregate instance after its first [`version`](Snapshot::version) events.
+///
+/// Only a context builds a snapshot. A store keeps it through serde, as a struct of
+/// `schema`, `version`, and `state`. `schema` identifies the aggregate's state structs, as
+/// declared with `#[oath::state]` when the snapshot was written; when they have changed
+/// since, the context ignores the snapshot and replays the instance's events instead.
+pub struct Snapshot<A> {
+    schema: u64,
+    version: Version,
+    state: serde_value::Value,
+    aggregate: core::marker::PhantomData<fn() -> A>,
+}
+
+impl<A> Snapshot<A> {
+    /// How many events of the instance the snapshot includes.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+}
+
+impl<A> Clone for Snapshot<A> {
+    fn clone(&self) -> Self {
+        Snapshot { schema: self.schema, version: self.version, state: self.state.clone(), aggregate: self.aggregate }
+    }
+}
+
+impl<A> core::fmt::Debug for Snapshot<A> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Snapshot").field("schema", &self.schema).field("version", &self.version).finish()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename = "Snapshot")]
+struct SnapshotFields {
+    schema: u64,
+    version: Version,
+    state: serde_value::Value,
+}
+
+impl<A> serde::Serialize for Snapshot<A> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SnapshotFields { schema: self.schema, version: self.version, state: self.state.clone() }.serialize(serializer)
+    }
+}
+
+impl<'de, A> serde::Deserialize<'de> for Snapshot<A> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let SnapshotFields { schema, version, state } = SnapshotFields::deserialize(deserializer)?;
+        Ok(Snapshot { schema, version, state, aggregate: core::marker::PhantomData })
+    }
+}
+
+/// A [`Store`] and [`ViewStore`] that keeps everything in memory, for tests and prototypes. It
+/// behaves as a database store does: it writes events, snapshots, and rows through serde and
+/// reads them back, keeps one ordered log, and refuses an append or a view save whose expected
+/// version or position is stale. Its `Default` holds nothing.
 #[derive(Default)]
 pub struct MemoryStore {
-    /// One `HashMap<A::Id, Vec<A::Event>>` per aggregate `A`, keyed by `A`'s type.
-    histories: std::collections::HashMap<core::any::TypeId, Box<dyn core::any::Any + Send + Sync>>,
+    memory: std::sync::Mutex<Memory>,
 }
 
-impl<A> Store<A> for MemoryStore
-where
-    A: Aggregate + 'static,
-    A::Id: Send + Sync + 'static,
-    A::Event: Clone + Send + Sync + 'static,
-{
-    fn load(&self, id: &A::Id) -> Vec<A::Event> {
-        self.histories
-            .get(&core::any::TypeId::of::<A>())
-            .and_then(|histories| histories.downcast_ref::<std::collections::HashMap<A::Id, Vec<A::Event>>>())
-            .and_then(|histories| histories.get(id))
-            .cloned()
-            .unwrap_or_default()
+#[derive(Default)]
+struct Memory {
+    head: u64,
+    /// One table per aggregate (`Instances<A>`) and per view (`Rows<V>`), keyed by its type.
+    tables: std::collections::HashMap<core::any::TypeId, Box<dyn core::any::Any + Send + Sync>>,
+}
+
+/// The instances of one aggregate in a [`MemoryStore`], and its part of the log.
+struct Instances<A: Aggregate> {
+    by_id: std::collections::HashMap<A::Id, Stored>,
+    log: Vec<(Position, serde_value::Value, serde_value::Value)>,
+}
+
+impl<A: Aggregate> Default for Instances<A> {
+    fn default() -> Self {
+        Instances { by_id: Default::default(), log: Vec::new() }
+    }
+}
+
+/// One instance in a [`MemoryStore`], as it would be written to a database.
+#[derive(Default)]
+struct Stored {
+    events: Vec<serde_value::Value>,
+    snapshot: Option<serde_value::Value>,
+}
+
+/// The rows of one view in a [`MemoryStore`].
+struct Rows<V: View> {
+    checkpoint: Option<serde_value::Value>,
+    by_key: std::collections::HashMap<V::Key, serde_value::Value>,
+}
+
+impl<V: View> Default for Rows<V> {
+    fn default() -> Self {
+        Rows { checkpoint: None, by_key: Default::default() }
+    }
+}
+
+impl MemoryStore {
+    fn with<T: Default + Send + Sync + 'static, R>(&self, f: impl FnOnce(&mut T, &mut u64) -> R) -> R {
+        let mut memory = self.memory.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Memory { head, tables } = &mut *memory;
+        let table = tables
+            .entry(core::any::TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut::<T>()
+            .expect("each table is keyed by its type");
+        f(table, head)
+    }
+}
+
+/// Reads back a value a [`MemoryStore`] wrote.
+fn read_back<T: serde::de::DeserializeOwned>(value: &serde_value::Value) -> T {
+    value.clone().deserialize_into().expect("MemoryStore reads back what it wrote")
+}
+
+fn write<T: serde::Serialize>(value: &T) -> serde_value::Value {
+    serde_value::to_value(value).expect("MemoryStore writes every value it keeps")
+}
+
+impl<A: Aggregate> Store<A> for MemoryStore {
+    type Error = core::convert::Infallible;
+
+    fn load(&self, id: &A::Id) -> impl Future<Output = Result<Loaded<A>, Self::Error>> + Send {
+        let loaded = self.with(|instances: &mut Instances<A>, _| {
+            let Some(stored) = instances.by_id.get(id) else {
+                return Loaded { snapshot: None, events: Vec::new() };
+            };
+            let snapshot: Option<Snapshot<A>> = stored.snapshot.as_ref().map(read_back);
+            let after = snapshot.as_ref().map_or(0, |snapshot| snapshot.version.0 as usize);
+            Loaded { events: stored.events[after..].iter().map(read_back).collect(), snapshot }
+        });
+        core::future::ready(Ok(loaded))
     }
 
-    fn append(&mut self, id: &A::Id, events: &[A::Event]) {
-        self.histories
-            .entry(core::any::TypeId::of::<A>())
-            .or_insert_with(|| Box::new(std::collections::HashMap::<A::Id, Vec<A::Event>>::new()))
-            .downcast_mut::<std::collections::HashMap<A::Id, Vec<A::Event>>>()
-            .expect("each aggregate's histories are keyed by its type")
-            .entry(id.clone())
-            .or_default()
-            .extend_from_slice(events);
+    fn events(&self, id: &A::Id, after: Version) -> impl Future<Output = Result<Vec<A::Event>, Self::Error>> + Send {
+        let events = self.with(|instances: &mut Instances<A>, _| {
+            let events = instances.by_id.get(id).map_or(&[][..], |stored| &stored.events[..]);
+            events.iter().skip(after.0 as usize).map(read_back).collect()
+        });
+        core::future::ready(Ok(events))
+    }
+
+    fn append(&self, decided: &Decided<A>) -> impl Future<Output = Result<(), AppendError<Self::Error>>> + Send {
+        let appended = self.with(|instances: &mut Instances<A>, head| {
+            let stored = instances.by_id.entry(decided.id().clone()).or_default();
+            if stored.events.len() as u64 != decided.expected().0 {
+                return Err(AppendError::Conflict);
+            }
+            for event in decided.events() {
+                *head += 1;
+                stored.events.push(write(event));
+                instances.log.push((Position(*head), write(decided.id()), write(event)));
+            }
+            stored.snapshot = Some(write(decided.snapshot()));
+            Ok(())
+        });
+        core::future::ready(appended)
+    }
+
+    fn head(&self) -> impl Future<Output = Result<Position, Self::Error>> + Send {
+        core::future::ready(Ok(self.with(|_: &mut Instances<A>, head| Position(*head))))
+    }
+
+    fn log(&self, after: Position, limit: usize) -> impl Future<Output = Result<Vec<Logged<A>>, Self::Error>> + Send {
+        let logged = self.with(|instances: &mut Instances<A>, _| {
+            let start = instances.log.partition_point(|(position, ..)| *position <= after);
+            instances.log[start..]
+                .iter()
+                .take(limit)
+                .map(|(position, id, event)| Logged { position: *position, id: read_back(id), event: read_back(event) })
+                .collect()
+        });
+        core::future::ready(Ok(logged))
+    }
+}
+
+impl<V: View> ViewStore<V> for MemoryStore {
+    type Error = core::convert::Infallible;
+
+    fn checkpoint(&self) -> impl Future<Output = Result<Option<Checkpoint<V>>, Self::Error>> + Send {
+        core::future::ready(Ok(self.with(|rows: &mut Rows<V>, _| rows.checkpoint.as_ref().map(read_back))))
+    }
+
+    fn row(&self, key: &V::Key) -> impl Future<Output = Result<Option<Row<V>>, Self::Error>> + Send {
+        core::future::ready(Ok(self.with(|rows: &mut Rows<V>, _| rows.by_key.get(key).map(read_back))))
+    }
+
+    fn save(&self, projected: &Projected<V>) -> impl Future<Output = Result<(), AppendError<Self::Error>>> + Send {
+        let saved = self.with(|rows: &mut Rows<V>, _| {
+            let saved = rows.checkpoint.as_ref().map(read_back::<Checkpoint<V>>);
+            if saved.map_or(Position(0), |checkpoint| checkpoint.position) != projected.expected() {
+                return Err(AppendError::Conflict);
+            }
+            rows.checkpoint = Some(write(projected.checkpoint()));
+            for (key, row) in projected.rows() {
+                rows.by_key.insert(key.clone(), write(row));
+            }
+            Ok(())
+        });
+        core::future::ready(saved)
     }
 }
 
@@ -510,6 +969,8 @@ pub mod __private {
 
     /// The serde the attribute macros derive with, so user crates need no serde dependency.
     pub use serde;
+    /// The serde-value the generated snapshot code writes states with.
+    pub use serde_value;
 
     use crate::{Emitted, EventOf, On};
 
@@ -640,8 +1101,85 @@ pub mod __private {
         label = "`{Self}` does not list `{V}`",
         note = "add `{V}` to the `views = [...]` of {Self}'s #[oath::context]"
     )]
-    pub trait Holds<V> {
-        fn held(&self) -> &V;
+    pub trait Holds<V: crate::View> {
+        fn view_store(&self) -> &dyn DynViewStore<V>;
+    }
+
+    /// How many events of each aggregate a context reads from the log at a time.
+    pub const LOG_BATCH: usize = 1000;
+
+    /// The log of a context: every event its aggregates recorded, in order. Implemented by
+    /// `#[oath::context]`.
+    pub trait Log {
+        /// The next events after `after`, in order, and the position up to which they are
+        /// every event of the context's aggregates in the log.
+        fn log<'a>(&'a self, after: crate::Position) -> BoxFuture<'a, Result<(Vec<Entry>, crate::Position), BoxError>>;
+    }
+
+    /// One event in a context's log.
+    pub struct Entry {
+        pub position: crate::Position,
+        id: Box<dyn core::any::Any + Send + Sync>,
+        event: Box<dyn core::any::Any + Send + Sync>,
+    }
+
+    impl Entry {
+        pub fn of<A: crate::Aggregate>(logged: crate::Logged<A>) -> Entry
+        where
+            A::Event: Inner,
+        {
+            Entry { position: logged.position, id: Box::new(logged.id), event: logged.event.into_any() }
+        }
+    }
+
+    /// Brings view `V` up to date with the log: takes in the events after its checkpoint, a
+    /// batch at a time, saving the rows they touch and the new checkpoint together. When
+    /// another context saved first, starts again from the checkpoint it saved.
+    pub async fn catch_up<V, S, L>(views: &S, log: &L) -> Result<(), BoxError>
+    where
+        V: crate::View,
+        S: DynViewStore<V> + ?Sized,
+        L: Log + Sync + ?Sized,
+    {
+        loop {
+            let saved = views.dyn_checkpoint().await?;
+            let expected = saved.as_ref().map_or(crate::Position(0), |checkpoint| checkpoint.position);
+            let current = saved.as_ref().is_some_and(|checkpoint| checkpoint.schema == V::FINGERPRINT);
+            // A view whose struct, key, or events changed is rebuilt from the start of the log.
+            let after = if current { expected } else { crate::Position(0) };
+            let (entries, upto) = log.log(after).await?;
+            if current && upto <= after {
+                return Ok(());
+            }
+            let mut rows = std::collections::HashMap::<V::Key, V>::new();
+            for entry in &entries {
+                let Some(key) = V::key_of(&*entry.id, &*entry.event) else { continue };
+                if !rows.contains_key(&key) {
+                    let row = views.dyn_row(&key).await?.and_then(crate::Row::restore).unwrap_or_default();
+                    rows.insert(key.clone(), row);
+                }
+                rows.get_mut(&key).expect("loaded above").apply(&*entry.event);
+            }
+            let projected = crate::Projected {
+                expected,
+                checkpoint: crate::Checkpoint {
+                    schema: V::FINGERPRINT,
+                    position: upto.max(after),
+                    view: core::marker::PhantomData,
+                },
+                rows: rows
+                    .into_iter()
+                    .map(|(key, row)| {
+                        let state = serde_value::to_value(&row).expect("a view row is written through serde");
+                        (key, crate::Row { schema: V::FINGERPRINT, state, view: core::marker::PhantomData })
+                    })
+                    .collect(),
+            };
+            match views.dyn_save(&projected).await {
+                Ok(()) | Err(crate::AppendError::Conflict) => continue,
+                Err(crate::AppendError::Store(error)) => return Err(error),
+            }
+        }
     }
 
     /// An event a view can subscribe to in context `C`: one an aggregate in `C` records.
@@ -667,28 +1205,181 @@ pub mod __private {
 
     /// The event struct inside one variant of an aggregate's event enum.
     pub trait Inner {
-        fn inner(&self) -> &dyn core::any::Any;
+        fn into_any(self) -> Box<dyn core::any::Any + Send + Sync>;
     }
 
-    /// Passes `event`, which instance `id` of aggregate `A` recorded, to `view`.
-    pub fn route<A: crate::Aggregate, V: crate::View>(view: &mut V, id: &A::Id, event: &A::Event)
-    where
-        A::Id: 'static,
-        A::Event: Inner,
-    {
-        view.route(id, event.inner());
+    /// What a context needs of a [`Store`](crate::Store): the same methods, as boxed futures
+    /// with boxed errors, so a context holds any store behind one trait object.
+    pub trait DynStore<A: crate::Aggregate>: Send + Sync {
+        fn dyn_load<'a>(&'a self, id: &'a A::Id) -> BoxFuture<'a, Result<crate::Loaded<A>, BoxError>>;
+        fn dyn_events<'a>(&'a self, id: &'a A::Id) -> BoxFuture<'a, Result<Vec<A::Event>, BoxError>>;
+        fn dyn_append<'a>(
+            &'a self,
+            decided: &'a crate::Decided<A>,
+        ) -> BoxFuture<'a, Result<(), crate::AppendError<BoxError>>>;
+        fn dyn_head(&self) -> BoxFuture<'_, Result<crate::Position, BoxError>>;
+        fn dyn_log(&self, after: crate::Position, limit: usize) -> BoxFuture<'_, Result<Vec<crate::Logged<A>>, BoxError>>;
     }
 
-    /// Replays the instance `command` targets from `store`, lets it decide, and appends the
-    /// events it records.
-    pub fn send<A: crate::Aggregate, S: crate::Store<A> + ?Sized>(
-        store: &mut S,
+    /// What a context needs of a [`ViewStore`](crate::ViewStore), as with [`DynStore`].
+    pub trait DynViewStore<V: crate::View>: Send + Sync {
+        fn dyn_checkpoint(&self) -> BoxFuture<'_, Result<Option<crate::Checkpoint<V>>, BoxError>>;
+        fn dyn_row<'a>(&'a self, key: &'a V::Key) -> BoxFuture<'a, Result<Option<crate::Row<V>>, BoxError>>;
+        fn dyn_save<'a>(
+            &'a self,
+            projected: &'a crate::Projected<V>,
+        ) -> BoxFuture<'a, Result<(), crate::AppendError<BoxError>>>;
+    }
+
+    fn boxed<E: std::error::Error + Send + Sync + 'static>(error: E) -> BoxError {
+        Box::new(error)
+    }
+
+    fn boxed_append<E: std::error::Error + Send + Sync + 'static>(
+        error: crate::AppendError<E>,
+    ) -> crate::AppendError<BoxError> {
+        match error {
+            crate::AppendError::Conflict => crate::AppendError::Conflict,
+            crate::AppendError::Store(error) => crate::AppendError::Store(boxed(error)),
+        }
+    }
+
+    impl<V: crate::View, S: crate::ViewStore<V>> DynViewStore<V> for S {
+        fn dyn_checkpoint(&self) -> BoxFuture<'_, Result<Option<crate::Checkpoint<V>>, BoxError>> {
+            Box::pin(async move { crate::ViewStore::checkpoint(self).await.map_err(boxed) })
+        }
+        fn dyn_row<'a>(&'a self, key: &'a V::Key) -> BoxFuture<'a, Result<Option<crate::Row<V>>, BoxError>> {
+            Box::pin(async move { crate::ViewStore::row(self, key).await.map_err(boxed) })
+        }
+        fn dyn_save<'a>(
+            &'a self,
+            projected: &'a crate::Projected<V>,
+        ) -> BoxFuture<'a, Result<(), crate::AppendError<BoxError>>> {
+            Box::pin(async move { crate::ViewStore::save(self, projected).await.map_err(boxed_append) })
+        }
+    }
+
+    pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+    pub type BoxFuture<'a, T> = core::pin::Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
+
+    impl<A: crate::Aggregate, S: crate::Store<A>> DynStore<A> for S {
+        fn dyn_load<'a>(&'a self, id: &'a A::Id) -> BoxFuture<'a, Result<crate::Loaded<A>, BoxError>> {
+            Box::pin(async move { crate::Store::load(self, id).await.map_err(|error| Box::new(error) as BoxError) })
+        }
+        fn dyn_events<'a>(&'a self, id: &'a A::Id) -> BoxFuture<'a, Result<Vec<A::Event>, BoxError>> {
+            Box::pin(async move {
+                crate::Store::events(self, id, crate::Version(0)).await.map_err(|error| Box::new(error) as BoxError)
+            })
+        }
+        fn dyn_append<'a>(
+            &'a self,
+            decided: &'a crate::Decided<A>,
+        ) -> BoxFuture<'a, Result<(), crate::AppendError<BoxError>>> {
+            Box::pin(async move { crate::Store::append(self, decided).await.map_err(boxed_append) })
+        }
+        fn dyn_head(&self) -> BoxFuture<'_, Result<crate::Position, BoxError>> {
+            Box::pin(async move { crate::Store::head(self).await.map_err(boxed) })
+        }
+        fn dyn_log(&self, after: crate::Position, limit: usize) -> BoxFuture<'_, Result<Vec<crate::Logged<A>>, BoxError>> {
+            Box::pin(async move { crate::Store::log(self, after, limit).await.map_err(boxed) })
+        }
+    }
+
+    /// How an aggregate's state goes into a snapshot. Implemented by `#[oath::aggregate]`.
+    pub trait Persist: Sized {
+        /// Identifies the aggregate's state structs, from their `#[oath::state]` fingerprints.
+        const SCHEMA: u64;
+        fn save(&self) -> serde_value::Value;
+        fn restore(state: serde_value::Value) -> Option<Self>;
+    }
+
+    /// A state struct marked `#[oath::state]`, or a view: serde, and a fingerprint of its
+    /// declaration.
+    #[diagnostic::on_unimplemented(
+        message = "state `{Self}` is not marked #[oath::state]",
+        label = "`{Self}` needs #[oath::state]",
+        note = "a snapshot stores the current state, so write #[oath::state] on `struct {Self}`"
+    )]
+    pub trait Persisted {
+        const FINGERPRINT: u64;
+    }
+
+    /// FNV-1a over `bytes`, continuing from `hash`.
+    pub const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+        let mut i = 0;
+        while i < bytes.len() {
+            hash ^= bytes[i] as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            i += 1;
+        }
+        hash
+    }
+
+    /// The schema of an aggregate: its state names and their fingerprints, in order.
+    pub const fn schema(states: &[(&str, u64)]) -> u64 {
+        let mut hash = 0xcbf29ce484222325;
+        let mut i = 0;
+        while i < states.len() {
+            hash = fnv(hash, states[i].0.as_bytes());
+            hash = fnv(hash, &states[i].1.to_le_bytes());
+            i += 1;
+        }
+        hash
+    }
+
+    /// The rejection of one aggregate, as the rejection of its context.
+    pub fn rejected_as<R, C>(error: crate::SendError<R>, f: impl FnOnce(R) -> C) -> crate::SendError<C> {
+        match error {
+            crate::SendError::Rejected(rejection) => crate::SendError::Rejected(f(rejection)),
+            crate::SendError::Conflict => crate::SendError::Conflict,
+            crate::SendError::Store(error) => crate::SendError::Store(error),
+            crate::SendError::Unreplayable(error) => crate::SendError::Unreplayable(error),
+        }
+    }
+
+    /// How many times `send` decides a command before it gives up on conflicts.
+    const ATTEMPTS: usize = 3;
+
+    /// Loads the instance `command` targets from `store`, lets it decide, and appends the
+    /// events it records with a snapshot of the new state, deciding again on a conflict.
+    pub async fn send<A: crate::Aggregate, S: DynStore<A> + ?Sized>(
+        store: &S,
         command: &A::Command,
-    ) -> Result<Vec<A::Event>, A::Rejection> {
-        let target = crate::Command::target(command);
-        let events = A::replay(&store.load(target)).decide(command)?;
-        store.append(target, &events);
-        Ok(events)
+    ) -> Result<Vec<A::Event>, crate::SendError<A::Rejection>> {
+        use crate::{AppendError, SendError, Snapshot, Version};
+        let id = crate::Command::target(command);
+        for _ in 0..ATTEMPTS {
+            let loaded = store.dyn_load(id).await.map_err(SendError::Store)?;
+            let (start, version, events) = match loaded.snapshot {
+                None => (A::default(), Version(0), loaded.events),
+                Some(snapshot) => match (snapshot.schema == A::SCHEMA).then(|| A::restore(snapshot.state)).flatten() {
+                    Some(state) => (state, snapshot.version, loaded.events),
+                    // Written by code whose states have since changed: replay every event.
+                    None => (A::default(), Version(0), store.dyn_events(id).await.map_err(SendError::Store)?),
+                },
+            };
+            let version = Version(version.0 + events.len() as u64);
+            let current = events.iter().try_fold(start, A::evolve).map_err(SendError::Unreplayable)?;
+            let recorded = current.decide(command).map_err(SendError::Rejected)?;
+            let next = recorded.iter().try_fold(current, A::evolve).map_err(SendError::Unreplayable)?;
+            let decided = crate::Decided {
+                id: id.clone(),
+                expected: version,
+                snapshot: Snapshot {
+                    schema: A::SCHEMA,
+                    version: Version(version.0 + recorded.len() as u64),
+                    state: next.save(),
+                    aggregate: core::marker::PhantomData,
+                },
+                events: recorded,
+            };
+            match store.dyn_append(&decided).await {
+                Ok(()) => return Ok(decided.events),
+                Err(AppendError::Conflict) => continue,
+                Err(AppendError::Store(error)) => return Err(SendError::Store(error)),
+            }
+        }
+        Err(SendError::Conflict)
     }
 
     /// Decodes the `kind` and fields [`read_tagged`] returned as the tagged enum `T`.
